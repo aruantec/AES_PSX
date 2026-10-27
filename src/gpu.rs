@@ -132,6 +132,9 @@ pub struct Gpu {
     pub vblank: bool,
     /// GPUSTAT bit31: odd scanline/field being output (timing model).
     pub odd_line: bool,
+    /// Apply the console's 4x4 ordered dither (GP0 E1.9). Off gives a
+    /// cleaner image; on matches hardware output.
+    pub dithering: bool,
 }
 
 impl Gpu {
@@ -165,6 +168,7 @@ impl Gpu {
             info_sel: 0,
             vblank: false,
             odd_line: false,
+            dithering: false,
         }
     }
 
@@ -612,19 +616,25 @@ impl Gpu {
             return;
         }
         let (cx0, cy0, cx1, cy1) = self.clip();
-        let (x0, x1) = (minx.max(cx0), (maxx - 1).min(cx1));
-        let (y0, y1) = (miny.max(cy0), (maxy - 1).min(cy1));
+        let (x0, x1) = (minx.max(cx0), maxx.min(cx1));
+        let (y0, y1) = (miny.max(cy0), maxy.min(cy1));
         if x0 > x1 || y0 > y1 {
             return;
         }
-        // with positive area in this y-down space, an edge a->b is a
-        // "top" edge when horizontal and heading -x, "left" when
-        // heading -y; those own their boundary pixels
+        // with positive area in this y-down space top edges run +x and
+        // left edges run -y; those own their boundary pixels
+        // (top-left rule), right/bottom edges don't.
         let bias = |a: &Vert, b: &Vert| -> i64 {
-            if (a.y == b.y && b.x < a.x) || b.y < a.y { 0 } else { -1 }
+            if (a.y == b.y && b.x > a.x) || b.y < a.y { 0 } else { -1 }
         };
         let (b0, b1, b2) = (bias(&v[1], &v[2]), bias(&v[2], &v[0]), bias(&v[0], &v[1]));
-        let dither = self.regs[1] & (1 << 9) != 0 && (sh.gouraud || (sh.textured && !sh.raw));
+        let dither = self.dithering
+            && self.regs[1] & (1 << 9) != 0
+            && (sh.gouraud || (sh.textured && !sh.raw));
+        // interpolation at the edges can overshoot the vertex range by
+        // a texel and wrap into neighbouring texture data
+        let (umin, umax) = (v[0].u.min(v[1].u).min(v[2].u), v[0].u.max(v[1].u).max(v[2].u));
+        let (vmin, vmax) = (v[0].v.min(v[1].v).min(v[2].v), v[0].v.max(v[1].v).max(v[2].v));
         for y in y0..=y1 {
             for x in x0..=x1 {
                 let w0 = edge(&v[1], &v[2], x, y);
@@ -642,8 +652,8 @@ impl Gpu {
                     (v[0].r, v[0].g, v[0].b)
                 };
                 let c = if sh.textured {
-                    let u = lerp(v[0].u, v[1].u, v[2].u);
-                    let tv = lerp(v[0].v, v[1].v, v[2].v);
+                    let u = lerp(v[0].u, v[1].u, v[2].u).clamp(umin, umax);
+                    let tv = lerp(v[0].v, v[1].v, v[2].v).clamp(vmin, vmax);
                     match self.texel(u, tv, sh.tpage, sh.clut) {
                         Some((t, semi)) => {
                             let m = if sh.raw {
@@ -926,5 +936,63 @@ impl Gpu {
             }
         }
         (w, h)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Draw-area covering all VRAM, offset 0.
+    fn gpu() -> Gpu {
+        let mut g = Gpu::new();
+        g.gp0(0xE300_0000);
+        g.gp0(0xE400_0000 | (511 << 10) | 1023);
+        g.gp0(0xE500_0000);
+        g
+    }
+
+    fn count(g: &Gpu, c: u16) -> usize {
+        g.vram.iter().filter(|&&p| p == c).count()
+    }
+
+    /// A quad split into two triangles must cover exactly w*h pixels:
+    /// no seam on the shared diagonal, no right/bottom overdraw.
+    #[test]
+    fn quad_covers_exactly_without_seams() {
+        for &(x0, y0, x1, y1) in &[(10, 10, 42, 26), (100, 50, 101, 51), (5, 7, 60, 9)] {
+            let mut g = gpu();
+            g.gp0(0x2800_00FF); // mono quad, red
+            for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+                g.gp0(((y as u32) << 16) | x as u32);
+            }
+            let red = 0x001F;
+            assert_eq!(count(&g, red), ((x1 - x0) * (y1 - y0)) as usize, "quad {x0},{y0}-{x1},{y1}");
+            assert_eq!(g.vram[y0 * 1024 + x0], red);
+            assert_eq!(g.vram[y0 * 1024 + x1], 0, "right edge must be excluded");
+            assert_eq!(g.vram[y1 * 1024 + x0], 0, "bottom edge must be excluded");
+        }
+    }
+
+    /// Two quads sharing an edge tile without gaps or overlap, in
+    /// both winding orders.
+    #[test]
+    fn adjacent_quads_tile() {
+        let mut g = gpu();
+        // semi-transparent additive blend would reveal overlap; use
+        // distinct colors and count instead
+        for (i, (xa, xb)) in [(0u32, 17u32), (17, 40)].iter().enumerate() {
+            g.gp0(0x2800_0000 | if i == 0 { 0xFF } else { 0xFF00 });
+            let pts = if i == 0 {
+                [(*xa, 3u32), (*xb, 3), (*xa, 30), (*xb, 30)]
+            } else {
+                [(*xb, 30), (*xa, 30), (*xb, 3), (*xa, 3)]
+            };
+            for (x, y) in pts {
+                g.gp0((y << 16) | x);
+            }
+        }
+        let filled = g.vram.iter().filter(|&&p| p != 0).count();
+        assert_eq!(filled, 40 * 27);
     }
 }
