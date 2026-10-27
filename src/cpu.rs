@@ -218,7 +218,6 @@ impl Cpu {
         }
         self.load_delay = self.load_new;
         self.load_new = (0, 0);
-        self.r[0] = 0;
         1 + extra + bus.stall
     }
 
@@ -598,8 +597,6 @@ impl Cpu {
             }
             _ => self.exception(EXC_RI),
         }
-        // r0 stays zero no matter what
-        self.r[0] = 0;
         0
     }
 

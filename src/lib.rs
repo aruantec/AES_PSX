@@ -280,18 +280,50 @@ impl Emulator {
 
     fn video_tick(&mut self, n: u32) {
         let pal = self.bus.gpu.is_pal();
-        let (num, den, line_len, lines) =
-            if pal { (11u64, 7u64, 3406u32, 314u32) } else { (715_909, 451_584, 3413, 263) };
         let v = &mut self.video;
-        v.frac += n as u64 * num;
-        let g = (v.frac / den) as u32;
-        v.frac %= den;
+        let (g, line_len, lines) = if pal {
+            let scaled = v.frac + n as u64 * 11;
+            let clocks = (scaled / 7) as u32;
+            v.frac = scaled % 7;
+            (clocks, 3406, 314)
+        } else {
+            let scaled = v.frac + n as u64 * 715_909;
+            let clocks = (scaled / 451_584) as u32;
+            v.frac = scaled % 451_584;
+            (clocks, 3413, 263)
+        };
 
         // dot clock for timer 0
         let div = self.bus.gpu.dot_divider();
         v.dot_acc += g;
-        let dots = v.dot_acc / div;
-        v.dot_acc %= div;
+        let dots = match div {
+            4 => {
+                let dots = v.dot_acc >> 2;
+                v.dot_acc &= 3;
+                dots
+            }
+            5 => {
+                let dots = v.dot_acc / 5;
+                v.dot_acc %= 5;
+                dots
+            }
+            7 => {
+                let dots = v.dot_acc / 7;
+                v.dot_acc %= 7;
+                dots
+            }
+            8 => {
+                let dots = v.dot_acc >> 3;
+                v.dot_acc &= 7;
+                dots
+            }
+            10 => {
+                let dots = v.dot_acc / 10;
+                v.dot_acc %= 10;
+                dots
+            }
+            _ => unreachable!("unsupported GPU dot divider {div}"),
+        };
         if dots > 0 {
             self.bus.timers.dots(dots);
         }

@@ -33,6 +33,14 @@ fn executes_reset_vector() {
 }
 
 #[test]
+fn writes_to_zero_register_are_ignored() {
+    let bios = fake_bios(&[0x2400_0001]); // addiu $zero,$zero,1
+    let mut emu = Emulator::new(bios);
+    emu.step();
+    assert_eq!(emu.cpu.rg(0), 0);
+}
+
+#[test]
 fn load_delay_slot_semantics() {
     // lw $t0,0($t1) with t1 → ram; addiu $t1 should see OLD t0? no:
     // the delay means a following instruction reads the OLD value.

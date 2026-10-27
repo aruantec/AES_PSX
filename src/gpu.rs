@@ -40,6 +40,14 @@ struct Shade {
     clut: u32,
 }
 
+#[derive(Clone, Copy)]
+struct Interp {
+    value: i32,
+    rem: i64,
+    delta: i32,
+    delta_rem: i64,
+}
+
 /// 4x4 ordered-dither offsets (GP0 E1 bit9).
 const DITHER: [[i32; 4]; 4] = [[-4, 0, -3, 1], [2, -2, 3, -1], [-3, 1, -4, 0], [3, -1, 2, -2]];
 
@@ -72,6 +80,88 @@ fn rgb15(c: u32) -> u16 {
     (((c >> 16) & 0xFF) as u16 >> 3) << 10
         | (((c >> 8) & 0xFF) as u16 >> 3) << 5
         | ((c & 0xFF) as u16 >> 3)
+}
+
+#[inline]
+fn split_interpolation(numerator: i64, area: i64) -> (i32, i64) {
+    (
+        numerator.div_euclid(area) as i32,
+        numerator.rem_euclid(area),
+    )
+}
+
+#[inline]
+fn interpolation(numerator: i64, delta: (i32, i64), area: i64) -> Interp {
+    let (value, rem) = split_interpolation(numerator, area);
+    Interp {
+        value,
+        rem,
+        delta: delta.0,
+        delta_rem: delta.1,
+    }
+}
+
+#[inline]
+fn edge_value(a: &Vert, b: &Vert, x: i32, y: i32) -> i64 {
+    (b.x - a.x) as i64 * (y - a.y) as i64 - (b.y - a.y) as i64 * (x - a.x) as i64
+}
+
+fn edge_span(a: &Vert, b: &Vert, x0: i32, x1: i32, y: i32, bias: i64) -> Option<(i32, i32)> {
+    let base = edge_value(a, b, x0, y) + bias;
+    let dx = -(b.y - a.y) as i64;
+    if dx > 0 {
+        let offset = if base >= 0 { 0 } else { (-base + dx - 1) / dx };
+        let left = x0 as i64 + offset;
+        (left <= x1 as i64).then_some((left as i32, x1))
+    } else if dx < 0 {
+        if base < 0 {
+            return None;
+        }
+        let right = x0 as i64 + base / -dx;
+        (right >= x0 as i64).then_some((x0, right.min(x1 as i64) as i32))
+    } else {
+        (base >= 0).then_some((x0, x1))
+    }
+}
+
+fn triangle_span(
+    v: &[Vert; 3],
+    x0: i32,
+    x1: i32,
+    y: i32,
+    biases: [i64; 3],
+) -> Option<(i32, i32)> {
+    let edges = [
+        (&v[1], &v[2], biases[0]),
+        (&v[2], &v[0], biases[1]),
+        (&v[0], &v[1], biases[2]),
+    ];
+    let mut left = x0;
+    let mut right = x1;
+    for (a, b, bias) in edges {
+        let (edge_left, edge_right) = edge_span(a, b, x0, x1, y, bias)?;
+        left = left.max(edge_left);
+        right = right.min(edge_right);
+        if left > right {
+            return None;
+        }
+    }
+    Some((left, right))
+}
+
+impl Interp {
+    #[inline]
+    fn advance(&mut self, area: i64) {
+        self.value += self.delta;
+        self.rem += self.delta_rem;
+        if self.rem >= area {
+            self.value += 1;
+            self.rem -= area;
+        } else if self.rem < 0 {
+            self.value -= 1;
+            self.rem += area;
+        }
+    }
 }
 
 /// Multiply a texel by the primitive's modulation color (0x80 = 1.0).
@@ -596,9 +686,7 @@ impl Gpu {
     /// inside plus those on top/left edges are drawn; right/bottom
     /// edges belong to the neighbouring primitive.
     fn tri(&mut self, v: &[Vert; 3], sh: Shade) {
-        let edge = |a: &Vert, b: &Vert, x: i32, y: i32| -> i64 {
-            (b.x - a.x) as i64 * (y - a.y) as i64 - (b.y - a.y) as i64 * (x - a.x) as i64
-        };
+        let edge = edge_value;
         let mut v = *v;
         let mut area = edge(&v[0], &v[1], v[2].x, v[2].y);
         if area == 0 {
@@ -635,48 +723,91 @@ impl Gpu {
         // a texel and wrap into neighbouring texture data
         let (umin, umax) = (v[0].u.min(v[1].u).min(v[2].u), v[0].u.max(v[1].u).max(v[2].u));
         let (vmin, vmax) = (v[0].v.min(v[1].v).min(v[2].v), v[0].v.max(v[1].v).max(v[2].v));
+        let edge_dx = [
+            -(v[2].y - v[1].y) as i64,
+            -(v[0].y - v[2].y) as i64,
+            -(v[1].y - v[0].y) as i64,
+        ];
+        let weighted = |a: i32, b: i32, c: i32, w: [i64; 3]| -> i64 {
+            a as i64 * w[0] + b as i64 * w[1] + c as i64 * w[2]
+        };
+        let weighted_dx = |a: i32, b: i32, c: i32| -> i64 {
+            a as i64 * edge_dx[0] + b as i64 * edge_dx[1] + c as i64 * edge_dx[2]
+        };
+        let color_delta = sh.gouraud.then(|| [
+            split_interpolation(weighted_dx(v[0].r, v[1].r, v[2].r), area),
+            split_interpolation(weighted_dx(v[0].g, v[1].g, v[2].g), area),
+            split_interpolation(weighted_dx(v[0].b, v[1].b, v[2].b), area),
+        ]);
+        let uv_delta = sh.textured.then(|| [
+            split_interpolation(weighted_dx(v[0].u, v[1].u, v[2].u), area),
+            split_interpolation(weighted_dx(v[0].v, v[1].v, v[2].v), area),
+        ]);
+        let biases = [b0, b1, b2];
         for y in y0..=y1 {
-            for x in x0..=x1 {
-                let w0 = edge(&v[1], &v[2], x, y);
-                let w1 = edge(&v[2], &v[0], x, y);
-                let w2 = edge(&v[0], &v[1], x, y);
-                if w0 + b0 < 0 || w1 + b1 < 0 || w2 + b2 < 0 {
-                    continue;
-                }
-                let lerp = |a: i32, b: i32, c: i32| -> i32 {
-                    ((a as i64 * w0 + b as i64 * w1 + c as i64 * w2) / area) as i32
-                };
+            let Some((span_x0, span_x1)) = triangle_span(&v, x0, x1, y, biases) else {
+                continue;
+            };
+            let weights = [
+                edge(&v[1], &v[2], span_x0, y),
+                edge(&v[2], &v[0], span_x0, y),
+                edge(&v[0], &v[1], span_x0, y),
+            ];
+            let mut colors = color_delta.map(|delta| [
+                interpolation(weighted(v[0].r, v[1].r, v[2].r, weights), delta[0], area),
+                interpolation(weighted(v[0].g, v[1].g, v[2].g, weights), delta[1], area),
+                interpolation(weighted(v[0].b, v[1].b, v[2].b, weights), delta[2], area),
+            ]);
+            let mut texcoords = uv_delta.map(|delta| [
+                interpolation(weighted(v[0].u, v[1].u, v[2].u, weights), delta[0], area),
+                interpolation(weighted(v[0].v, v[1].v, v[2].v, weights), delta[1], area),
+            ]);
+            for x in span_x0..=span_x1 {
                 let (r, g, b) = if sh.gouraud {
-                    (lerp(v[0].r, v[1].r, v[2].r), lerp(v[0].g, v[1].g, v[2].g), lerp(v[0].b, v[1].b, v[2].b))
+                    let c = colors.as_ref().unwrap();
+                    (c[0].value, c[1].value, c[2].value)
                 } else {
                     (v[0].r, v[0].g, v[0].b)
                 };
-                let c = if sh.textured {
-                    let u = lerp(v[0].u, v[1].u, v[2].u).clamp(umin, umax);
-                    let tv = lerp(v[0].v, v[1].v, v[2].v).clamp(vmin, vmax);
-                    match self.texel(u, tv, sh.tpage, sh.clut) {
-                        Some((t, semi)) => {
-                            let m = if sh.raw {
-                                t
-                            } else {
-                                let col = (r.clamp(0, 255) as u32)
-                                    | ((g.clamp(0, 255) as u32) << 8)
-                                    | ((b.clamp(0, 255) as u32) << 16);
-                                modulate_d(t, col, dither, x, y)
-                            };
-                            if sh.semitrans && semi {
-                                self.blend(x, y, m, sh.tpage)
-                            } else {
-                                m | if semi { 0x8000 } else { 0 }
-                            }
-                        }
-                        None => continue,
+                if sh.textured {
+                    let uv = texcoords.as_ref().unwrap();
+                    let u = uv[0].value.clamp(umin, umax);
+                    let tv = uv[1].value.clamp(vmin, vmax);
+                    if let Some((t, semi)) = self.texel(u, tv, sh.tpage, sh.clut) {
+                        let m = if sh.raw {
+                            t
+                        } else {
+                            let col = (r.clamp(0, 255) as u32)
+                                | ((g.clamp(0, 255) as u32) << 8)
+                                | ((b.clamp(0, 255) as u32) << 16);
+                            modulate_d(t, col, dither, x, y)
+                        };
+                        let c = if sh.semitrans && semi {
+                            self.blend(x, y, m, sh.tpage)
+                        } else {
+                            m | if semi { 0x8000 } else { 0 }
+                        };
+                        self.put(x, y, c);
                     }
                 } else {
                     let c15 = shade15(r, g, b, dither, x, y);
-                    if sh.semitrans { self.blend(x, y, c15, self.regs[1]) } else { c15 }
-                };
-                self.put(x, y, c);
+                    let c = if sh.semitrans {
+                        self.blend(x, y, c15, self.regs[1])
+                    } else {
+                        c15
+                    };
+                    self.put(x, y, c);
+                }
+                if let Some(c) = colors.as_mut() {
+                    for interp in c {
+                        interp.advance(area);
+                    }
+                }
+                if let Some(uv) = texcoords.as_mut() {
+                    for interp in uv {
+                        interp.advance(area);
+                    }
+                }
             }
         }
     }
@@ -954,6 +1085,68 @@ mod tests {
 
     fn count(g: &Gpu, c: u16) -> usize {
         g.vram.iter().filter(|&&p| p == c).count()
+    }
+
+    #[test]
+    fn incremental_interpolation_matches_division() {
+        for &area in &[1i64, 2, 7, 31, 1024, 524_000] {
+            for &start in &[-area * 2 - 1, -area, -1, 0, 1, area - 1, area, area * 2 + 1] {
+                for &delta in &[-area - 1, -area, -1, 0, 1, area, area + 1] {
+                    let (dv, dr) = split_interpolation(delta, area);
+                    let mut interp = interpolation(start, (dv, dr), area);
+                    let mut numerator = start;
+                    for _ in 0..12 {
+                        assert_eq!(interp.value as i64, numerator.div_euclid(area));
+                        interp.advance(area);
+                        numerator += delta;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn triangle_spans_match_pixel_edge_rule() {
+        let mut seed = 0xA341_316Cu32;
+        for _ in 0..1000 {
+            let mut v = [Vert::default(); 3];
+            for p in &mut v {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                p.x = ((seed >> 16) % 41) as i32 - 5;
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                p.y = ((seed >> 16) % 41) as i32 - 5;
+            }
+            let area = edge_value(&v[0], &v[1], v[2].x, v[2].y);
+            if area == 0 {
+                continue;
+            }
+            if area < 0 {
+                v.swap(1, 2);
+            }
+            let bias = |a: &Vert, b: &Vert| {
+                if (a.y == b.y && b.x > a.x) || b.y < a.y {
+                    0
+                } else {
+                    -1
+                }
+            };
+            let biases = [
+                bias(&v[1], &v[2]),
+                bias(&v[2], &v[0]),
+                bias(&v[0], &v[1]),
+            ];
+            for y in -5..=35 {
+                let covered: Vec<i32> = (-5..=35)
+                    .filter(|&x| {
+                        edge_value(&v[1], &v[2], x, y) + biases[0] >= 0
+                            && edge_value(&v[2], &v[0], x, y) + biases[1] >= 0
+                            && edge_value(&v[0], &v[1], x, y) + biases[2] >= 0
+                    })
+                    .collect();
+                let expected = covered.first().zip(covered.last()).map(|(&a, &b)| (a, b));
+                assert_eq!(triangle_span(&v, -5, 35, y, biases), expected);
+            }
+        }
     }
 
     /// A quad split into two triangles must cover exactly w*h pixels:
