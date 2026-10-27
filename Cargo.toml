@@ -1,0 +1,22 @@
+[package]
+name = "aruanpsx"
+version = "0.1.0"
+edition = "2024"
+description = "PlayStation (PSX) emulator core — standalone library, embeddable via the Core trait"
+license = "MIT"
+
+[dependencies]
+sha2 = "0.11"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[dev-dependencies]
+cpal = "0.15"
+gilrs = "0.11"
+minifb = "0.28.0"
+
+# The boot tests execute hundreds of millions of instructions.
+[profile.test]
+opt-level = 3
