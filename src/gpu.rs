@@ -2093,12 +2093,12 @@ impl Gpu {
             let o = &mut out[y * w..(y + 1) * w];
             if self.display_24bpp() {
                 for (x, px) in o.iter_mut().enumerate() {
-                    let b0 = dx * 2 + x * 3;
-                    let byte = |i: usize| -> u32 {
-                        let hw = self.vram[row + ((i / 2) & (VRAM_W - 1))];
-                        ((hw >> ((i & 1) * 8)) & 0xFF) as u32
-                    };
-                    *px = byte(b0) << 16 | byte(b0 + 1) << 8 | byte(b0 + 2);
+                    let byte = dx * 2 + x * 3;
+                    let word = byte / 2;
+                    let pair = self.vram[row + (word & (VRAM_W - 1))] as u32
+                        | (self.vram[row + ((word + 1) & (VRAM_W - 1))] as u32) << 16;
+                    let rgb = (pair >> ((byte & 1) * 8)) & 0x00FF_FFFF;
+                    *px = ((rgb & 0xFF) << 16) | (rgb & 0x00FF_00) | ((rgb >> 16) & 0xFF);
                 }
             } else {
                 for (x, px) in o.iter_mut().enumerate() {
@@ -2466,5 +2466,29 @@ mod tests {
         let mut output = Vec::new();
         let (width, _) = g.display_rgb(&mut output);
         assert_eq!(width, g.display_size().0 as usize);
+    }
+
+    #[test]
+    fn rgb24_scanout_reads_packed_triplets_and_wraps_at_vram_edge() {
+        let mut g = gpu();
+        g.disp_mode = 0x11; // 320x240, 24bpp
+        g.disp_disabled = false;
+        g.v_range = (0, 16);
+        g.disp_x = 1;
+        g.disp_y = 0;
+        g.vram[1] = 0x2211;
+        g.vram[2] = 0x4433;
+        g.vram[3] = 0x6655;
+        let mut out = Vec::new();
+        let (w, _) = g.display_rgb(&mut out);
+        assert_eq!(w, 320);
+        assert_eq!(&out[..2], &[0x0011_2233, 0x0044_5566]);
+
+        g.disp_x = 1023;
+        g.vram[1023] = 0x2211;
+        g.vram[0] = 0x4433;
+        g.vram[1] = 0x6655;
+        g.display_rgb(&mut out);
+        assert_eq!(out[0], 0x0011_2233);
     }
 }

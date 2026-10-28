@@ -75,7 +75,10 @@ impl Mdec {
         if self.out.is_empty() {
             s |= 1 << 31;
         }
-        if self.state != State::Idle {
+        // Keep the command busy until decoded output has also been
+        // consumed. FF9's strip uploader polls bit 29 to decide whether
+        // the next 16-pixel slice belongs to the current movie frame.
+        if self.state != State::Idle || !self.out.is_empty() {
             s |= 1 << 29;
         }
         if self.dma_in && self.state != State::Idle {
@@ -229,6 +232,30 @@ impl Mdec {
         Some(blk)
     }
 
+    /// Find the first halfword after a complete RLE block, skipping
+    /// input padding. This lets color_block verify a full macroblock
+    /// before consuming any input.
+    fn block_end(&self, mut pos: usize) -> Option<usize> {
+        while pos < self.halfwords.len() && self.halfwords[pos] == 0xFE00 {
+            pos += 1;
+        }
+        if pos >= self.halfwords.len() {
+            return None;
+        }
+        let mut coefficients = 0usize;
+        let mut next = pos + 1;
+        loop {
+            if next >= self.halfwords.len() {
+                return None;
+            }
+            coefficients += ((self.halfwords[next] >> 10) & 0x3F) as usize + 1;
+            next += 1;
+            if coefficients > 63 {
+                return Some(next);
+            }
+        }
+    }
+
     fn idct(&self, blk: &mut [i32; 64]) {
         let mut tmp = [0i64; 64];
         // rows: tmp = blk · S  (S indexed [z*8 + x])
@@ -298,18 +325,21 @@ impl Mdec {
 
     fn color_block(&mut self) -> bool {
         // need Cr, Cb, Y1..Y4 = 6 complete blocks before emitting;
-        // decode them one at a time into a staging area.
-        let snapshot: Vec<u16> = self.halfwords.iter().copied().collect();
+        // check completeness without copying the input FIFO.
+        let mut pos = 0usize;
+        for _ in 0..6 {
+            pos = match self.block_end(pos) {
+                Some(end) => end,
+                None => return false,
+            };
+        }
         let (qy, qc) = (self.quant_y, self.quant_c);
         let mut blocks = Vec::with_capacity(6);
         for b in 0..6 {
             self.block_idx = [4, 5, 0, 1, 2, 3][b];
             match self.take_block(if b < 2 { &qc } else { &qy }) {
                 Some(x) => blocks.push(x),
-                None => {
-                    self.halfwords = snapshot.into();
-                    return false;
-                }
+                None => return false,
             }
         }
         let (cr, cb) = (&blocks[0], &blocks[1]);
@@ -364,5 +394,40 @@ impl Mdec {
         }
         self.block_idx = 4;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Mdec;
+
+    #[test]
+    fn busy_stays_set_until_decoded_output_is_drained() {
+        let mut m = Mdec::new();
+        // One 15bpp color macroblock: Cr, Cb, Y1..Y4. Each block is a
+        // DC coefficient followed by an end-of-block run.
+        m.write_cmd(0x3800_0006);
+        let block = 0xFC00_0400;
+        for _ in 0..6 {
+            m.write_cmd(block);
+        }
+
+        assert_eq!(m.read_stat() & (1 << 29), 1 << 29);
+        assert!(m.out_len() > 0);
+        while m.out_len() > 0 {
+            m.read_data();
+        }
+        assert_eq!(m.read_stat() & (1 << 29), 0);
+    }
+
+    #[test]
+    fn incomplete_color_macroblock_is_not_consumed() {
+        let mut m = Mdec::new();
+        m.write_cmd(0x3800_0006);
+        for _ in 0..5 {
+            m.write_cmd(0xFC00_0400);
+        }
+        assert_eq!(m.halfwords.len(), 10);
+        assert_eq!(m.out_len(), 0);
     }
 }
