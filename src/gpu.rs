@@ -15,13 +15,14 @@
 
 const VRAM_W: usize = 1024;
 const VRAM_H: usize = 512;
+const PENDING_NATIVE_LIMIT: usize = 32_768;
 
 // ---- hardware-render op stream --------------------------------------
-// When a host-GPU backend is attached the core keeps doing the full
-// native-resolution pass (VRAM stays CPU-visible and exact) and records
-// each drawing command as an op the backend replays into a scaled
-// render target — the same split DuckStation/Beetle use: native domain
-// for texture/CPU reads, scaled domain for rasterized output.
+// When a host-GPU backend is attached the core records drawing ops for
+// the scaled host target and defers native CPU rasterization until a
+// CPU-visible VRAM read/write or framebuffer-texture hazard needs it.
+// This keeps native VRAM authoritative without rasterizing every draw
+// twice on the CPU.
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HwVert {
@@ -452,6 +453,9 @@ pub struct Gpu {
     hw_render: bool,
     /// Recorded op stream, drained by the backend each frame.
     hw_ops: Vec<HwOp>,
+    /// Hardware-rasterized primitives not yet resolved to native VRAM.
+    /// They are rasterized on demand before a CPU-visible read/write.
+    pending_native: Vec<HwPrim>,
     /// VRAM rects dirtied by rasterization since the last textured
     /// draw — resolved lazily when a primitive samples them.
     raster_dirty: Vec<(u16, u16, u16, u16)>,
@@ -523,6 +527,7 @@ impl Gpu {
             suppress_hires_mirror: false,
             hw_render: false,
             hw_ops: Vec::new(),
+            pending_native: Vec::new(),
             raster_dirty: Vec::new(),
             gp0_cmd: 0,
             gp0_len: 0,
@@ -621,21 +626,28 @@ impl Gpu {
         }
     }
 
-    /// Enable 2x/4x/8x polygon rasterization while retaining native
+    /// Enable integer-scale polygon rendering while retaining native
     /// VRAM for texture reads and CPU-visible transfers.
     pub fn set_internal_scale(&mut self, scale: u8) -> bool {
         let scale = match scale {
-            1 | 2 | 4 | 8 => scale as usize,
+            1 | 2 | 4 | 6 | 8 => scale as usize,
             _ => return false,
         };
+        self.flush_pending_native();
         if self.render_scale == scale {
             return true;
         }
         self.render_scale = scale;
         self.render_hires = false;
         self.suppress_hires_mirror = false;
+        self.rebuild_hires_surface();
+        true
+    }
+
+    fn rebuild_hires_surface(&mut self) {
         self.hires_vram.clear();
-        if scale > 1 {
+        if self.render_scale > 1 && !self.hw_render {
+            let scale = self.render_scale;
             let width = VRAM_W * scale;
             self.hires_vram.resize(VRAM_W * VRAM_H * scale * scale, 0);
             for y in 0..VRAM_H {
@@ -645,7 +657,6 @@ impl Gpu {
             }
             debug_assert_eq!(self.hires_vram.len(), width * VRAM_H * scale);
         }
-        true
     }
 
     pub fn internal_scale(&self) -> u8 {
@@ -654,9 +665,13 @@ impl Gpu {
 
     /// Attach a host-GPU backend. When enabled (with scale > 1), draw
     /// commands are recorded into an op stream and the CPU hires pass
-    /// is skipped; native VRAM stays authoritative for CPU reads.
+    /// is skipped; native VRAM is lazily resolved before CPU access.
     pub fn set_hw_render(&mut self, on: bool) {
+        if !on {
+            self.flush_pending_native();
+        }
         self.hw_render = on;
+        self.rebuild_hires_surface();
         self.hw_ops.clear();
         self.raster_dirty.clear();
     }
@@ -673,6 +688,13 @@ impl Gpu {
     /// Display crop in native VRAM coords for the backend's scanout.
     pub fn hw_display_crop(&self) -> (u32, u32, u32, u32) {
         self.display_crop()
+    }
+
+    /// Resolve deferred hardware-rendered primitives to CPU-visible
+    /// native VRAM. Embedders must call this before reading `vram`
+    /// directly while host-GPU rendering is enabled.
+    pub fn sync_native_vram(&mut self) {
+        self.flush_pending_native();
     }
 
     fn mirror_hires_pixel(&mut self, x: usize, y: usize, color: u16) {
@@ -733,12 +755,19 @@ impl Gpu {
         let cx = ((clut & 0x3F) * 16) as u32;
         let cy = ((clut >> 6) & 0x1FF) as u32;
         let clut_r = (cx, cy, cx + 256, cy + 1);
+        let hit = |r: (u16, u16, u16, u16), b: (u32, u32, u32, u32)| {
+            r.0 as u32 <= b.2 && r.2 as u32 >= b.0 && r.1 as u32 <= b.3 && r.3 as u32 >= b.1
+        };
+        if self
+            .raster_dirty
+            .iter()
+            .any(|&r| hit(r, page) || hit(r, clut_r))
+        {
+            self.flush_pending_native();
+        }
         let dirty = std::mem::take(&mut self.raster_dirty);
         for r in dirty {
-            let hit = |b: (u32, u32, u32, u32)| {
-                r.0 as u32 <= b.2 && r.2 as u32 >= b.0 && r.1 as u32 <= b.3 && r.3 as u32 >= b.1
-            };
-            if hit(page) || hit(clut_r) {
+            if hit(r, page) || hit(r, clut_r) {
                 self.hw_ops.push(HwOp::Upload {
                     x0: r.0,
                     y0: r.1,
@@ -753,7 +782,7 @@ impl Gpu {
 
     /// Record one primitive for the hardware backend and mark its
     /// native footprint dirty for later texture feedback.
-    fn record_prim(&mut self, v: &[Vert], n: usize, sh: &Shade, extra: u16) {
+    fn record_prim(&mut self, v: &[Vert], n: usize, sh: &Shade, extra: u16) -> HwPrim {
         if sh.textured {
             self.flush_dirty_for_tex(sh.tpage as u16, sh.clut as u16);
         }
@@ -800,7 +829,7 @@ impl Gpu {
         {
             flags |= hw_flags::DITHER;
         }
-        self.hw_ops.push(HwOp::Prim(HwPrim {
+        let prim = HwPrim {
             verts: hv,
             n: n as u8,
             pad: 0,
@@ -812,8 +841,155 @@ impl Gpu {
             pad2: 0,
             clip: [cx0 as i16, cy0 as i16, (cx1 + 1) as i16, (cy1 + 1) as i16],
             uv_bounds: [u0 as i16, v0 as i16, u1 as i16, v1 as i16],
-        }));
+        };
+        self.hw_ops.push(HwOp::Prim(prim));
         self.dirty_raster_rect(x0, y0, x1, y1);
+        self.pending_native.push(prim);
+        if self.pending_native.len() >= PENDING_NATIVE_LIMIT {
+            self.flush_pending_native();
+        }
+        prim
+    }
+
+    /// Resolve deferred primitive operations into native VRAM. The host
+    /// renderer keeps the enhanced result; this software pass is paid
+    /// only when CPU-visible VRAM semantics or feedback require it.
+    pub(crate) fn flush_pending_native(&mut self) {
+        if self.pending_native.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_native);
+        let old_regs = self.regs;
+        let (old_texwin, old_set, old_check, old_dither, old_hires) = (
+            self.texwin,
+            self.mask_set,
+            self.mask_check,
+            self.dithering,
+            self.render_hires,
+        );
+        self.render_hires = false;
+        for p in pending {
+            let flags = p.flags;
+            let x0 = (p.clip[0] as i32).clamp(0, 1023) as u32;
+            let y0 = (p.clip[1] as i32).clamp(0, 511) as u32;
+            let x1 = (p.clip[2] as i32 - 1).clamp(x0 as i32, 1023) as u32;
+            let y1 = (p.clip[3] as i32 - 1).clamp(y0 as i32, 511) as u32;
+            self.regs[1] = (p.tpage as u32 & 0x9FF)
+                | if flags & hw_flags::DITHER != 0 {
+                    1 << 9
+                } else {
+                    0
+                };
+            self.regs[3] = x0 | (y0 << 10);
+            self.regs[4] = x1 | (y1 << 10);
+            self.texwin = p.texwin;
+            self.mask_set = flags & hw_flags::MASK_SET != 0;
+            self.mask_check = flags & hw_flags::MASK_CHECK != 0;
+            self.dithering = flags & hw_flags::DITHER != 0;
+
+            let vert = |v: HwVert| Vert {
+                x: v.x as i32,
+                y: v.y as i32,
+                r: v.r as i32,
+                g: v.g as i32,
+                b: v.b as i32,
+                u: v.u as i32,
+                v: v.v as i32,
+            };
+            let sh = Shade {
+                textured: flags & hw_flags::TEXTURED != 0,
+                gouraud: flags & hw_flags::GOURAUD != 0,
+                semitrans: flags & hw_flags::SEMITRANS != 0,
+                raw: flags & hw_flags::RAW != 0,
+                tpage: p.tpage as u32,
+                clut: p.clut as u32,
+            };
+            if flags & hw_flags::LINE != 0 {
+                self.line(vert(p.verts[0]), vert(p.verts[1]), sh.semitrans);
+            } else if flags & hw_flags::RECT != 0 {
+                let (x, y) = (p.verts[0].x as i32, p.verts[0].y as i32);
+                let w = (p.verts[1].x as i32 - x).max(0);
+                let h = (p.verts[2].y as i32 - y).max(0);
+                let (u0, v0) = (p.uv_bounds[0] as i32, p.uv_bounds[1] as i32);
+                let col = p.col;
+                let xflip = flags & hw_flags::XFLIP != 0;
+                let yflip = flags & hw_flags::YFLIP != 0;
+                let (cx0, cy0, cx1, cy1) = self.clip();
+                for dy in 0..h {
+                    for dx in 0..w {
+                        let (px, py) = (x + dx, y + dy);
+                        if px < cx0 || px > cx1 || py < cy0 || py > cy1 {
+                            continue;
+                        }
+                        let (tu, tv) = (
+                            if xflip { w - 1 - dx } else { dx },
+                            if yflip { h - 1 - dy } else { dy },
+                        );
+                        let c = if sh.textured {
+                            match self.texel(u0 + tu, v0 + tv, sh.tpage, sh.clut) {
+                                Some((t, semi)) => {
+                                    let m = if sh.raw { t } else { modulate(t, col) };
+                                    if sh.semitrans && semi {
+                                        Some(self.blend(px, py, m, sh.tpage))
+                                    } else {
+                                        Some(m | if semi { 0x8000 } else { 0 })
+                                    }
+                                }
+                                None => None,
+                            }
+                        } else {
+                            let c15 = rgb15(col);
+                            Some(if sh.semitrans {
+                                self.blend(px, py, c15, self.regs[1])
+                            } else {
+                                c15
+                            })
+                        };
+                        if let Some(c) = c {
+                            self.put(px, py, c);
+                        }
+                    }
+                }
+            } else {
+                let v = p.verts.map(vert);
+                self.tri(&[v[0], v[1], v[2]], sh);
+                if p.n == 4 {
+                    self.tri(&[v[1], v[2], v[3]], sh);
+                }
+            }
+        }
+        self.regs = old_regs;
+        self.texwin = old_texwin;
+        self.mask_set = old_set;
+        self.mask_check = old_check;
+        self.dithering = old_dither;
+        self.render_hires = old_hires;
+    }
+
+    /// A native fill/upload completely replaces earlier primitive pixels
+    /// inside its rectangle, so those deferred CPU raster jobs are dead.
+    /// Keep partial overlaps for an eventual readback.
+    fn discard_pending_covered_by_rect(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
+        if x0 >= x1 || y0 >= y1 || x1 > VRAM_W || y1 > VRAM_H {
+            return;
+        }
+        self.pending_native.retain(|p| {
+            let n = (p.n as usize).min(4);
+            if n == 0 {
+                return true;
+            }
+            let mut px0 = p.verts[..n].iter().map(|v| v.x as i32).min().unwrap_or(0);
+            let mut py0 = p.verts[..n].iter().map(|v| v.y as i32).min().unwrap_or(0);
+            let mut px1 = p.verts[..n].iter().map(|v| v.x as i32).max().unwrap_or(0);
+            let mut py1 = p.verts[..n].iter().map(|v| v.y as i32).max().unwrap_or(0);
+            if p.flags & hw_flags::LINE != 0 {
+                px0 -= 1;
+                py0 -= 1;
+                px1 += 1;
+                py1 += 1;
+            }
+            !(px0 >= x0 as i32 && py0 >= y0 as i32 && px1 <= x1 as i32 && py1 <= y1 as i32)
+        });
     }
 
     /// GPUSTAT — composed live from the E1/E6/GP1 registers.
@@ -861,6 +1037,9 @@ impl Gpu {
     /// GPUREAD — pulls the next word of an in-flight VRAM→CPU read;
     /// otherwise serves GP1(10h) info requests.
     pub fn read_data(&mut self) -> u32 {
+        if self.vram_rd.is_some() {
+            self.flush_pending_native();
+        }
         if let Some((x, y, w, _h, left, total)) = self.vram_rd {
             if left == 0 {
                 self.vram_rd = None;
@@ -1023,6 +1202,15 @@ impl Gpu {
                 let y = ((yx >> 16) & 0x1FF) as u16;
                 let w = (((wh & 0x3FF) + 0xF) & !0xF).max(0x10) as u16;
                 let h = (wh >> 16 & 0x1FF).max(1) as u16;
+                if self.hw_render {
+                    self.discard_pending_covered_by_rect(
+                        x as usize,
+                        y as usize,
+                        x as usize + w as usize,
+                        y as usize + h as usize,
+                    );
+                }
+                self.flush_pending_native();
                 for yy in y..y + h {
                     for xx in x..x + w {
                         self.write_native_pixel(xx as usize, yy as usize, c);
@@ -1047,12 +1235,23 @@ impl Gpu {
                 let y = ((yx >> 16) & 0x1FF) as u16;
                 let words = (w as u32 * h as u32 + 1) & !1;
                 if self.gp0_cmd >> 24 == 0xA0 {
+                    if self.hw_render {
+                        self.discard_pending_covered_by_rect(
+                            x as usize,
+                            y as usize,
+                            x as usize + w as usize,
+                            y as usize + h as usize,
+                        );
+                    }
+                    self.flush_pending_native();
                     self.vram_wr = Some((x, y, w, h, words, words));
                 } else {
+                    self.flush_pending_native();
                     self.vram_rd = Some((x, y, w, h, words, words));
                 }
             }
             0x80 => {
+                self.flush_pending_native();
                 // vram copy: p0=src yx, p1=dst yx, p2=wh
                 let s = self.gp0_params[0];
                 let d = self.gp0_params[1];
@@ -1178,6 +1377,7 @@ impl Gpu {
         };
         if self.hw_render {
             self.record_prim(&v[..n], n, &sh, 0);
+            return;
         }
         self.tri(&[v[0], v[1], v[2]], sh);
         if quad {
@@ -1207,8 +1407,9 @@ impl Gpu {
                 clut: 0,
             };
             self.record_prim(&[a, b], 2, &sh, hw_flags::LINE);
+        } else {
+            self.line(a, b, st);
         }
-        self.line(a, b, st);
     }
 
     /// Polyline strip — `words` ends with the 0x55555555 terminator.
@@ -1240,8 +1441,9 @@ impl Gpu {
                         clut: 0,
                     };
                     self.record_prim(&[p, v], 2, &sh, hw_flags::LINE);
+                } else {
+                    self.line(p, v, st);
                 }
-                self.line(p, v, st);
             }
             prev = Some(v);
         }
@@ -1313,6 +1515,7 @@ impl Gpu {
                 &sh,
                 hw_flags::RECT | hw_flags::XFLIP * xflip as u16 | hw_flags::YFLIP * yflip as u16,
             );
+            return;
         }
         let (cx0, cy0, cx1, cy1) = self.clip();
         for dy in 0..h.max(0) {
@@ -2136,6 +2339,102 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(5, 9), (18, 9), (5, 16), (18, 16)]
         );
+    }
+
+    #[test]
+    fn host_renderer_does_not_allocate_cpu_hires_vram() {
+        let mut g = gpu();
+        g.set_hw_render(true);
+        assert!(g.set_internal_scale(8));
+        assert!(g.hires_vram.is_empty());
+        assert_eq!(g.internal_scale(), 8);
+    }
+
+    #[test]
+    fn hardware_polygon_native_vram_is_resolved_on_readback() {
+        let mut g = gpu();
+        assert!(g.set_internal_scale(4));
+        g.set_hw_render(true);
+        g.gp0(0x2000_00FF);
+        for (x, y) in [(20u32, 20u32), (44, 20), (20, 44)] {
+            g.gp0((y << 16) | x);
+        }
+        assert_eq!(count(&g, 0x001F), 0, "native pass should be deferred");
+        assert_eq!(g.pending_native.len(), 1);
+
+        g.gp0(0xC000_0000);
+        g.gp0((20 << 16) | 20);
+        g.gp0((1 << 16) | 1);
+        assert!(g.pending_native.is_empty());
+        assert_eq!(g.read_data() & 0xFFFF, 0x001F);
+    }
+
+    #[test]
+    fn hardware_deferred_polygon_flushes_before_native_fill() {
+        let mut g = gpu();
+        assert!(g.set_internal_scale(2));
+        g.set_hw_render(true);
+        g.gp0(0x2000_00FF);
+        for (x, y) in [(20u32, 20u32), (44, 20), (20, 44)] {
+            g.gp0((y << 16) | x);
+        }
+        g.gp0(0x0200_FF00); // green native fill
+        g.gp0((16 << 16) | 16);
+        g.gp0((16 << 16) | 16);
+        assert!(g.pending_native.is_empty());
+        assert_eq!(g.vram[20 * VRAM_W + 20], 0x03E0);
+    }
+
+    #[test]
+    fn hardware_fill_discards_native_work_it_fully_covers() {
+        let mut g = gpu();
+        assert!(g.set_internal_scale(4));
+        g.set_hw_render(true);
+        g.gp0(0x2000_00FF);
+        for (x, y) in [(20u32, 20u32), (44, 20), (20, 44)] {
+            g.gp0((y << 16) | x);
+        }
+        assert_eq!(g.pending_native.len(), 1);
+
+        // This aligned fill fully replaces the pending triangle's bounds.
+        g.gp0(0x0200_FF00);
+        g.gp0((16 << 16) | 16);
+        g.gp0((48 << 16) | 48);
+        assert!(g.pending_native.is_empty());
+        assert_eq!(count(&g, 0x001F), 0);
+        assert_eq!(g.vram[20 * VRAM_W + 20], 0x03E0);
+    }
+
+    #[test]
+    fn texture_feedback_flushes_only_when_native_page_overlaps() {
+        let mut g = gpu();
+        assert!(g.set_internal_scale(4));
+        g.set_hw_render(true);
+        g.gp0(0x2000_00FF);
+        for (x, y) in [(20u32, 20u32), (44, 20), (20, 44)] {
+            g.gp0((y << 16) | x);
+        }
+        assert_eq!(count(&g, 0x001F), 0);
+
+        // Textured triangle uses page/CLUT zero, overlapping the pending
+        // native draw. The prior polygon must resolve before the texture op.
+        g.gp0(0x2400_00FF);
+        for word in [
+            (80u32 << 16) | 80,
+            0,
+            (80 << 16) | 100,
+            0,
+            (100 << 16) | 80,
+            0,
+        ] {
+            g.gp0(word);
+        }
+        assert!(g.vram[20 * VRAM_W + 20] == 0x001F);
+        assert_eq!(g.pending_native.len(), 1);
+        let ops = g.take_hw_ops();
+        assert!(matches!(ops.first(), Some(HwOp::Prim(_))));
+        assert!(matches!(ops.get(1), Some(HwOp::Upload { .. })));
+        assert!(matches!(ops.get(2), Some(HwOp::Prim(_))));
     }
 
     #[test]

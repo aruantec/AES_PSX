@@ -15,8 +15,11 @@ notes).
 - GTE command set and register-file behavior
 - Scanline-level video timing and a native-resolution software GPU
 - Optional WGPU hardware polygon renderer for enhanced internal
-  resolutions; native VRAM remains authoritative for CPU reads and
-  texture/CLUT data
+  resolutions; draw commands rasterize on the host GPU and native VRAM
+  is resolved lazily when CPU readback or framebuffer-texture feedback
+  requires it. `Emulator::framebuffer()` synchronizes before reading;
+  code reading `bus.gpu.vram` directly should call
+  `bus.gpu.sync_native_vram()` first.
 - CD-ROM, XA-ADPCM/CD-DA audio, SPU voices/ADSR/noise/reverb, MDEC,
   DMA, timers, controllers, and memory cards
 - CPAL audio output uses a lock-free single-producer/single-consumer
@@ -32,7 +35,7 @@ cargo run --release --example play_gpu -- <game.cue> [bios.bin] --res=4x
 ```
 
 `--res` controls internal polygon rendering, not the host window.
-Supported scales are `1x`, `2x`, `4x`, and `8x`; a `WIDTHxHEIGHT`
+Supported scales are `1x`, `2x`, `4x`, `6x`, and `8x`; a `WIDTHxHEIGHT`
 value such as `3840x2160` selects the nearest supported scale. For a
 typical 512x240 game mode, `3840x2160` selects `8x`.
 `--window-size=WIDTHxHEIGHT` changes only the window. `--sw` forces
@@ -49,7 +52,7 @@ toggles PS1 dithering. Gamepads are also supported.
 Nearest texture sampling preserves the PS1 look. Bilinear filtering
 filters decoded texture colors while clamping samples to each
 primitive's UV bounds; it smooths low-resolution textures but can
-soften pixel-art details. At `4x` and `8x`, bilinear is selected by
+soften pixel-art details. At `4x`, `6x`, and `8x`, bilinear is selected by
 default; use `--texture-filter=nearest` or press `T` to change it.
 `F` affects only final display scaling.
 

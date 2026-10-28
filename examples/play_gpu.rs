@@ -259,6 +259,7 @@ fn parse_internal_scale(value: &str) -> Result<u8, String> {
         "1x" | "native" => return Ok(1),
         "2x" => return Ok(2),
         "4x" => return Ok(4),
+        "6x" => return Ok(6),
         "8x" => return Ok(8),
         _ => {}
     }
@@ -277,7 +278,7 @@ fn parse_internal_scale(value: &str) -> Result<u8, String> {
         return Err("internal resolution must be at least 512x240".into());
     }
     let requested = (width as f64 / 512.0).min(height as f64 / 240.0);
-    Ok([1u8, 2, 4, 8]
+    Ok([1u8, 2, 4, 6, 8]
         .into_iter()
         .min_by(|a, b| ((*a as f64 - requested).abs()).total_cmp(&(*b as f64 - requested).abs()))
         .unwrap_or(1))
@@ -2050,7 +2051,7 @@ fn main() {
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let Some(cue) = pos.first() else {
         eprintln!(
-            "usage: play_gpu <game.cue> [bios.bin] [--fast] [--dynarec] [--res=2x|4x|8x|WIDTHxHEIGHT] [--texture-filter=nearest|bilinear]"
+            "usage: play_gpu <game.cue> [bios.bin] [--fast] [--dynarec] [--res=2x|4x|6x|8x|WIDTHxHEIGHT] [--texture-filter=nearest|bilinear]"
         );
         eprintln!("Use --window-size=WIDTHxHEIGHT to resize only the window.");
         std::process::exit(1);
@@ -2058,11 +2059,11 @@ fn main() {
     let bios_path = pos.get(1).map(|s| s.as_str()).unwrap_or(DEFAULT_BIOS);
     let mut emulator = Emulator::new(std::fs::read(bios_path).expect("read BIOS"));
     emulator.set_dynarec_enabled(dynarec);
+    emulator.set_hw_render(internal_scale > 1 && !sw_render);
     if !emulator.set_internal_resolution_scale(internal_scale) {
         eprintln!("internal resolution scale {internal_scale}x is unsupported");
         std::process::exit(2);
     }
-    emulator.set_hw_render(internal_scale > 1 && !sw_render);
     emulator.insert_disc(Disc::load(std::path::Path::new(cue.as_str())).expect("load disc"));
     if fast && !emulator.fast_boot_disc() {
         eprintln!("fast boot unavailable; using BIOS boot");
@@ -2137,6 +2138,7 @@ mod tests {
     fn internal_resolution_selects_polygon_scale_not_window_size() {
         assert_eq!(parse_internal_scale("2x").unwrap(), 2);
         assert_eq!(parse_internal_scale("4x").unwrap(), 4);
+        assert_eq!(parse_internal_scale("6x").unwrap(), 6);
         assert_eq!(parse_internal_scale("3840x2160").unwrap(), 8);
         assert_eq!(parse_internal_scale("3840×2160").unwrap(), 8);
     }

@@ -262,7 +262,8 @@ impl Emulator {
 
     /// Render the current display into `out` (0x00RRGGBB); returns
     /// (width, height).
-    pub fn framebuffer(&self, out: &mut Vec<u32>) -> (usize, usize) {
+    pub fn framebuffer(&mut self, out: &mut Vec<u32>) -> (usize, usize) {
+        self.bus.gpu.sync_native_vram();
         self.bus.gpu.display_rgb(out)
     }
 
