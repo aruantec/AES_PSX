@@ -37,20 +37,21 @@ value such as `3840x2160` selects the nearest supported scale. For a
 typical 512x240 game mode, `3840x2160` selects `8x`.
 `--window-size=WIDTHxHEIGHT` changes only the window. `--sw` forces
 software rendering, `--fast` skips the BIOS shell, and `--dynarec`
-enables the experimental CPU translator.
+enables the experimental CPU translator. `--texture-filter=nearest`
+or `--texture-filter=bilinear` selects polygon texture filtering.
 
 Controls: arrows = D-pad; Z/X/A/S = Cross/Circle/Square/Triangle;
 Q/W = L1/R1; E/R = L2/R2; Enter = Start; Backspace = Select;
 Tab = fast-forward; Esc = quit. `F` toggles display scaling
-(smooth/sharp), `T` toggles bilinear polygon texture filtering
-(nearest is the default), and `D` toggles PS1 dithering. Gamepads
-are also supported.
+(smooth/sharp), `T` toggles polygon texture filtering, and `D`
+toggles PS1 dithering. Gamepads are also supported.
 
-Nearest texture sampling is the default and preserves the PS1 look.
-Press `T` for optional bilinear filtering; it filters decoded texture
-colors while clamping samples to each primitive's UV bounds. This can
-soften blocky textures but may blur pixel-art details. `F` affects
-only final display scaling.
+Nearest texture sampling preserves the PS1 look. Bilinear filtering
+filters decoded texture colors while clamping samples to each
+primitive's UV bounds; it smooths low-resolution textures but can
+soften pixel-art details. At `4x` and `8x`, bilinear is selected by
+default; use `--texture-filter=nearest` or press `T` to change it.
+`F` affects only final display scaling.
 
 The hardware renderer rasterizes polygons on the host GPU. FSR 3/4 is
 not used: temporal upscalers need motion vectors and frame history
