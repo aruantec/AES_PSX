@@ -125,6 +125,39 @@ impl Emulator {
         self.dynarec.compiled_op_count()
     }
 
+    /// Set the GPU's internal polygon-render scale (1x, 2x, 4x, or 8x).
+    /// Native VRAM reads and texture sampling stay at hardware resolution.
+    pub fn set_internal_resolution_scale(&mut self, scale: u8) -> bool {
+        self.bus.gpu.set_internal_scale(scale)
+    }
+
+    /// Attach/detach a host-GPU renderer. While active, draw commands
+    /// are recorded as ops (see `take_gpu_hw_ops`) and the frontend
+    /// owns scaled rasterization + scanout.
+    pub fn set_hw_render(&mut self, on: bool) {
+        self.bus.gpu.set_hw_render(on);
+    }
+
+    pub fn hw_render(&self) -> bool {
+        self.bus.gpu.hw_render()
+    }
+
+    /// Drain the recorded hardware-render op stream for this frame.
+    pub fn take_gpu_hw_ops(&mut self) -> Vec<gpu::HwOp> {
+        self.bus.gpu.take_hw_ops()
+    }
+
+    /// Display crop in native VRAM coords (x0, y0, x1, y1).
+    pub fn gpu_display_crop(&self) -> (u32, u32, u32, u32) {
+        self.bus.gpu.hw_display_crop()
+    }
+
+    /// True while the displayed mode reads packed 24bpp VRAM (FMV);
+    /// the hardware path can't present that — fall back to CPU output.
+    pub fn gpu_display_is_24bpp(&self) -> bool {
+        self.bus.gpu.display_24bpp()
+    }
+
     pub fn insert_disc(&mut self, d: disc::Disc) {
         self.bus.cdrom.insert(d);
     }
