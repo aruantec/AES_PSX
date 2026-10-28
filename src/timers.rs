@@ -116,7 +116,12 @@ impl Timers {
         for c in &mut t {
             c.reset_mode(0);
         }
-        Self { t, pending_irq: 0, in_hblank: false, in_vblank: false }
+        Self {
+            t,
+            pending_irq: 0,
+            in_hblank: false,
+            in_vblank: false,
+        }
     }
 
     fn line(i: usize) -> u16 {

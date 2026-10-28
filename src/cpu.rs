@@ -21,19 +21,19 @@ use crate::gte::Gte;
 
 // ---- exception codes (Cop0 CAUSE.ExcCode) ----
 #[allow(dead_code)]
-const EXC_INT: u32 = 0;   // Interrupt
-const EXC_ADEL: u32 = 4;  // address error on load
-const EXC_ADES: u32 = 5;  // address error on store
+const EXC_INT: u32 = 0; // Interrupt
+const EXC_ADEL: u32 = 4; // address error on load
+const EXC_ADES: u32 = 5; // address error on store
 #[allow(dead_code)]
-const EXC_IBE: u32 = 6;   // bus error on instruction fetch
+const EXC_IBE: u32 = 6; // bus error on instruction fetch
 #[allow(dead_code)]
-const EXC_DBE: u32 = 7;   // bus error on data access
-const EXC_SYS: u32 = 8;   // syscall
-const EXC_BP: u32 = 9;    // breakpoint
-const EXC_RI: u32 = 10;   // reserved/undefined instruction
+const EXC_DBE: u32 = 7; // bus error on data access
+const EXC_SYS: u32 = 8; // syscall
+const EXC_BP: u32 = 9; // breakpoint
+const EXC_RI: u32 = 10; // reserved/undefined instruction
 #[allow(dead_code)]
-const EXC_CPU: u32 = 11;  // coprocessor unusable
-const EXC_OV: u32 = 12;   // arithmetic overflow
+const EXC_CPU: u32 = 11; // coprocessor unusable
+const EXC_OV: u32 = 12; // arithmetic overflow
 
 const COP0_SR: u8 = 12;
 const COP0_CAUSE: u8 = 13;
@@ -116,12 +116,24 @@ impl Cpu {
     }
 
     // ---- snapshot accessors ----
-    pub fn regs_copy(&self) -> [u32; 32] { self.r }
-    pub fn hi(&self) -> u32 { self.hi }
-    pub fn lo(&self) -> u32 { self.lo }
-    pub fn pc_raw(&self) -> u32 { self.pc }
-    pub fn next_pc_raw(&self) -> u32 { self.next_pc }
-    pub fn cop0_copy(&self) -> [u32; 16] { self.cop0 }
+    pub fn regs_copy(&self) -> [u32; 32] {
+        self.r
+    }
+    pub fn hi(&self) -> u32 {
+        self.hi
+    }
+    pub fn lo(&self) -> u32 {
+        self.lo
+    }
+    pub fn pc_raw(&self) -> u32 {
+        self.pc
+    }
+    pub fn next_pc_raw(&self) -> u32 {
+        self.next_pc
+    }
+    pub fn cop0_copy(&self) -> [u32; 16] {
+        self.cop0
+    }
     pub fn load_regs(
         &mut self,
         r: [u32; 32],
@@ -272,7 +284,11 @@ impl Cpu {
             self.cop0[COP0_EPC as usize] = self.cur_pc;
         }
         self.cop0[COP0_CAUSE as usize] = cause;
-        let vector = if sr & (1 << 22) != 0 { 0xBFC0_0180 } else { 0x8000_0080 };
+        let vector = if sr & (1 << 22) != 0 {
+            0xBFC0_0180
+        } else {
+            0x8000_0080
+        };
         self.pc = vector;
         self.next_pc = vector + 4;
         self.in_delay_slot = false;
@@ -353,11 +369,11 @@ impl Cpu {
 
         match op >> 26 {
             0x00 => match op & 0x3F {
-                0x00 => self.set_r(rd, self.rg(rt) << sa),            // SLL
-                0x02 => self.set_r(rd, self.rg(rt) >> sa),            // SRL
+                0x00 => self.set_r(rd, self.rg(rt) << sa), // SLL
+                0x02 => self.set_r(rd, self.rg(rt) >> sa), // SRL
                 0x03 => self.set_r(rd, ((self.rg(rt) as i32) >> sa) as u32), // SRA
-                0x04 => self.set_r(rd, self.rg(rt) << (self.rg(rs) & 31)),  // SLLV
-                0x06 => self.set_r(rd, self.rg(rt) >> (self.rg(rs) & 31)),  // SRLV
+                0x04 => self.set_r(rd, self.rg(rt) << (self.rg(rs) & 31)), // SLLV
+                0x06 => self.set_r(rd, self.rg(rt) >> (self.rg(rs) & 31)), // SRLV
                 0x07 => self.set_r(rd, ((self.rg(rt) as i32) >> (self.rg(rs) & 31)) as u32), // SRAV
                 0x08 => {
                     // JR
@@ -370,23 +386,32 @@ impl Cpu {
                     self.link(rd);
                     self.branch(t);
                 }
-                0x0C => self.exception(EXC_SYS),                      // SYSCALL
-                0x0D => self.exception(EXC_BP),                       // BREAK
-                0x10 => { let v = self.hi; self.set_r(rd, v); }       // MFHI
-                0x11 => self.hi = self.rg(rs),                        // MTHI
-                0x12 => { let v = self.lo; self.set_r(rd, v); }       // MFLO
-                0x13 => self.lo = self.rg(rs),                        // MTLO
-                0x18 => {                                             // MULT
+                0x0C => self.exception(EXC_SYS), // SYSCALL
+                0x0D => self.exception(EXC_BP),  // BREAK
+                0x10 => {
+                    let v = self.hi;
+                    self.set_r(rd, v);
+                } // MFHI
+                0x11 => self.hi = self.rg(rs),   // MTHI
+                0x12 => {
+                    let v = self.lo;
+                    self.set_r(rd, v);
+                } // MFLO
+                0x13 => self.lo = self.rg(rs),   // MTLO
+                0x18 => {
+                    // MULT
                     let p = (self.rg(rs) as i32 as i64) * (self.rg(rt) as i32 as i64);
                     self.lo = p as u32;
                     self.hi = (p >> 32) as u32;
                 }
-                0x19 => {                                             // MULTU
+                0x19 => {
+                    // MULTU
                     let p = (self.rg(rs) as u64) * (self.rg(rt) as u64);
                     self.lo = p as u32;
                     self.hi = (p >> 32) as u32;
                 }
-                0x1A => {                                             // DIV
+                0x1A => {
+                    // DIV
                     let a = self.rg(rs) as i32;
                     let b = self.rg(rt) as i32;
                     if b == 0 {
@@ -400,7 +425,8 @@ impl Cpu {
                         self.hi = (a % b) as u32;
                     }
                 }
-                0x1B => {                                             // DIVU
+                0x1B => {
+                    // DIVU
                     let a = self.rg(rs);
                     let b = self.rg(rt);
                     if b == 0 {
@@ -411,7 +437,8 @@ impl Cpu {
                         self.hi = a % b;
                     }
                 }
-                0x20 => {                                             // ADD
+                0x20 => {
+                    // ADD
                     let a = self.rg(rs) as i32;
                     let b = self.rg(rt) as i32;
                     match a.checked_add(b) {
@@ -420,7 +447,8 @@ impl Cpu {
                     }
                 }
                 0x21 => self.set_r(rd, self.rg(rs).wrapping_add(self.rg(rt))), // ADDU
-                0x22 => {                                             // SUB
+                0x22 => {
+                    // SUB
                     let a = self.rg(rs) as i32;
                     let b = self.rg(rt) as i32;
                     match a.checked_sub(b) {
@@ -429,12 +457,12 @@ impl Cpu {
                     }
                 }
                 0x23 => self.set_r(rd, self.rg(rs).wrapping_sub(self.rg(rt))), // SUBU
-                0x24 => self.set_r(rd, self.rg(rs) & self.rg(rt)),    // AND
-                0x25 => self.set_r(rd, self.rg(rs) | self.rg(rt)),    // OR
-                0x26 => self.set_r(rd, self.rg(rs) ^ self.rg(rt)),    // XOR
-                0x27 => self.set_r(rd, !(self.rg(rs) | self.rg(rt))), // NOR
+                0x24 => self.set_r(rd, self.rg(rs) & self.rg(rt)),             // AND
+                0x25 => self.set_r(rd, self.rg(rs) | self.rg(rt)),             // OR
+                0x26 => self.set_r(rd, self.rg(rs) ^ self.rg(rt)),             // XOR
+                0x27 => self.set_r(rd, !(self.rg(rs) | self.rg(rt))),          // NOR
                 0x2A => self.set_r(rd, ((self.rg(rs) as i32) < self.rg(rt) as i32) as u32), // SLT
-                0x2B => self.set_r(rd, (self.rg(rs) < self.rg(rt)) as u32),                 // SLTU
+                0x2B => self.set_r(rd, (self.rg(rs) < self.rg(rt)) as u32),    // SLTU
                 _ => self.exception(EXC_RI),
             },
             0x01 => {
@@ -448,29 +476,40 @@ impl Cpu {
                     self.link(31);
                 }
                 if rt & 1 != 0 {
-                    if v >= 0 { self.branch(t) }
+                    if v >= 0 {
+                        self.branch(t)
+                    }
                 } else if v < 0 {
                     self.branch(t)
                 }
             }
-            0x02 => { self.branch(target); }                          // J
-            0x03 => { self.link(31); self.branch(target); }           // JAL
-            0x04 => {                                                 // BEQ
+            0x02 => {
+                self.branch(target);
+            } // J
+            0x03 => {
+                self.link(31);
+                self.branch(target);
+            } // JAL
+            0x04 => {
+                // BEQ
                 if self.rg(rs) == self.rg(rt) {
                     self.branch(self.cur_pc.wrapping_add(4).wrapping_add((imm as u32) << 2));
                 }
             }
-            0x05 => {                                                 // BNE
+            0x05 => {
+                // BNE
                 if self.rg(rs) != self.rg(rt) {
                     self.branch(self.cur_pc.wrapping_add(4).wrapping_add((imm as u32) << 2));
                 }
             }
-            0x06 => {                                                 // BLEZ
+            0x06 => {
+                // BLEZ
                 if (self.rg(rs) as i32) <= 0 {
                     self.branch(self.cur_pc.wrapping_add(4).wrapping_add((imm as u32) << 2));
                 }
             }
-            0x07 => {                                                 // BGTZ
+            0x07 => {
+                // BGTZ
                 if (self.rg(rs) as i32) > 0 {
                     self.branch(self.cur_pc.wrapping_add(4).wrapping_add((imm as u32) << 2));
                 }
@@ -478,7 +517,8 @@ impl Cpu {
             // Branch-likely (R3000): a NOT-taken branch annuls its
             // delay slot — the next fetch must skip it entirely, so
             // bump pc (not just next_pc) past it.
-            0x14 => {                                                 // BEQL
+            0x14 => {
+                // BEQL
                 if self.rg(rs) == self.rg(rt) {
                     self.branch(self.cur_pc.wrapping_add(4).wrapping_add((imm as u32) << 2));
                 } else {
@@ -486,7 +526,8 @@ impl Cpu {
                     self.next_pc = self.cur_pc.wrapping_add(12);
                 }
             }
-            0x15 => {                                                 // BNEL
+            0x15 => {
+                // BNEL
                 if self.rg(rs) != self.rg(rt) {
                     self.branch(self.cur_pc.wrapping_add(4).wrapping_add((imm as u32) << 2));
                 } else {
@@ -494,7 +535,8 @@ impl Cpu {
                     self.next_pc = self.cur_pc.wrapping_add(12);
                 }
             }
-            0x16 => {                                                 // BLEZL
+            0x16 => {
+                // BLEZL
                 if (self.rg(rs) as i32) <= 0 {
                     self.branch(self.cur_pc.wrapping_add(4).wrapping_add((imm as u32) << 2));
                 } else {
@@ -502,7 +544,8 @@ impl Cpu {
                     self.next_pc = self.cur_pc.wrapping_add(12);
                 }
             }
-            0x17 => {                                                 // BGTZL
+            0x17 => {
+                // BGTZL
                 if (self.rg(rs) as i32) > 0 {
                     self.branch(self.cur_pc.wrapping_add(4).wrapping_add((imm as u32) << 2));
                 } else {
@@ -510,7 +553,8 @@ impl Cpu {
                     self.next_pc = self.cur_pc.wrapping_add(12);
                 }
             }
-            0x08 => {                                                 // ADDI
+            0x08 => {
+                // ADDI
                 let a = self.rg(rs) as i32;
                 match a.checked_add(imm) {
                     Some(v) => self.set_r(rt, v as u32),
@@ -520,24 +564,33 @@ impl Cpu {
             0x09 => self.set_r(rt, self.rg(rs).wrapping_add(imm as u32)), // ADDIU
             0x0A => self.set_r(rt, ((self.rg(rs) as i32) < imm) as u32),  // SLTI
             0x0B => self.set_r(rt, (self.rg(rs) < (imm as u32)) as u32),  // SLTIU
-            0x0C => self.set_r(rt, self.rg(rs) & uimm),               // ANDI
-            0x0D => self.set_r(rt, self.rg(rs) | uimm),               // ORI
-            0x0E => self.set_r(rt, self.rg(rs) ^ uimm),               // XORI
-            0x0F => self.set_r(rt, uimm << 16),                       // LUI
-            0x10 => self.cop0(op, bus),                               // COP0
-            0x12 => return self.cop2(op),                             // COP2 (GTE)
-            0x20 => {                                                 // LB
+            0x0C => self.set_r(rt, self.rg(rs) & uimm),                   // ANDI
+            0x0D => self.set_r(rt, self.rg(rs) | uimm),                   // ORI
+            0x0E => self.set_r(rt, self.rg(rs) ^ uimm),                   // XORI
+            0x0F => self.set_r(rt, uimm << 16),                           // LUI
+            0x10 => self.cop0(op, bus),                                   // COP0
+            0x12 => return self.cop2(op),                                 // COP2 (GTE)
+            0x20 => {
+                // LB
                 let a = self.rg(rs).wrapping_add(imm as u32);
                 let v = bus.load8(a) as i8 as i32 as u32;
                 self.load_new = (rt, v);
             }
-            0x21 => {                                                 // LH
+            0x21 => {
+                // LH
                 let a = self.rg(rs).wrapping_add(imm as u32);
-                if a & 1 != 0 { self.cop0[8] = a; { self.exception(EXC_ADEL); return 0; } }
+                if a & 1 != 0 {
+                    self.cop0[8] = a;
+                    {
+                        self.exception(EXC_ADEL);
+                        return 0;
+                    }
+                }
                 let v = bus.load16(a) as i16 as i32 as u32;
                 self.load_new = (rt, v);
             }
-            0x22 => {                                                 // LWL
+            0x22 => {
+                // LWL
                 let a = self.rg(rs).wrapping_add(imm as u32);
                 let aligned = bus.load32(a & !3);
                 let cur = if rt == self.load_delay.reg {
@@ -553,24 +606,40 @@ impl Cpu {
                 };
                 self.load_new = (rt, v);
             }
-            0x23 => {                                                 // LW
+            0x23 => {
+                // LW
                 let a = self.rg(rs).wrapping_add(imm as u32);
-                if a & 3 != 0 { self.cop0[8] = a; { self.exception(EXC_ADEL); return 0; } }
+                if a & 3 != 0 {
+                    self.cop0[8] = a;
+                    {
+                        self.exception(EXC_ADEL);
+                        return 0;
+                    }
+                }
                 let v = bus.load32(a);
                 self.load_new = (rt, v);
             }
-            0x24 => {                                                 // LBU
+            0x24 => {
+                // LBU
                 let a = self.rg(rs).wrapping_add(imm as u32);
                 let v = bus.load8(a) as u32;
                 self.load_new = (rt, v);
             }
-            0x25 => {                                                 // LHU
+            0x25 => {
+                // LHU
                 let a = self.rg(rs).wrapping_add(imm as u32);
-                if a & 1 != 0 { self.cop0[8] = a; { self.exception(EXC_ADEL); return 0; } }
+                if a & 1 != 0 {
+                    self.cop0[8] = a;
+                    {
+                        self.exception(EXC_ADEL);
+                        return 0;
+                    }
+                }
                 let v = bus.load16(a) as u32;
                 self.load_new = (rt, v);
             }
-            0x26 => {                                                 // LWR
+            0x26 => {
+                // LWR
                 let a = self.rg(rs).wrapping_add(imm as u32);
                 let aligned = bus.load32(a & !3);
                 let cur = if rt == self.load_delay.reg {
@@ -586,16 +655,25 @@ impl Cpu {
                 };
                 self.load_new = (rt, v);
             }
-            0x28 => {                                                 // SB
+            0x28 => {
+                // SB
                 let a = self.rg(rs).wrapping_add(imm as u32);
                 bus.store8(a, self.rg(rt) as u8);
             }
-            0x29 => {                                                 // SH
+            0x29 => {
+                // SH
                 let a = self.rg(rs).wrapping_add(imm as u32);
-                if a & 1 != 0 { self.cop0[8] = a; { self.exception(EXC_ADES); return 0; } }
+                if a & 1 != 0 {
+                    self.cop0[8] = a;
+                    {
+                        self.exception(EXC_ADES);
+                        return 0;
+                    }
+                }
                 bus.store16(a, self.rg(rt) as u16);
             }
-            0x2A => {                                                 // SWL
+            0x2A => {
+                // SWL
                 let a = self.rg(rs).wrapping_add(imm as u32);
                 let w = bus.load32(a & !3);
                 let v = match a & 3 {
@@ -606,12 +684,20 @@ impl Cpu {
                 };
                 bus.store32(a & !3, v);
             }
-            0x2B => {                                                 // SW
+            0x2B => {
+                // SW
                 let a = self.rg(rs).wrapping_add(imm as u32);
-                if a & 3 != 0 { self.cop0[8] = a; { self.exception(EXC_ADES); return 0; } }
+                if a & 3 != 0 {
+                    self.cop0[8] = a;
+                    {
+                        self.exception(EXC_ADES);
+                        return 0;
+                    }
+                }
                 bus.store32(a, self.rg(rt));
             }
-            0x2E => {                                                 // SWR
+            0x2E => {
+                // SWR
                 let a = self.rg(rs).wrapping_add(imm as u32);
                 let w = bus.load32(a & !3);
                 let v = match a & 3 {
@@ -622,14 +708,28 @@ impl Cpu {
                 };
                 bus.store32(a & !3, v);
             }
-            0x32 => {                                                 // LWC2
+            0x32 => {
+                // LWC2
                 let a = self.rg(rs).wrapping_add(imm as u32);
-                if a & 3 != 0 { self.cop0[8] = a; { self.exception(EXC_ADEL); return 0; } }
+                if a & 3 != 0 {
+                    self.cop0[8] = a;
+                    {
+                        self.exception(EXC_ADEL);
+                        return 0;
+                    }
+                }
                 self.gte.write_data(rt, bus.load32(a));
             }
-            0x3A => {                                                 // SWC2
+            0x3A => {
+                // SWC2
                 let a = self.rg(rs).wrapping_add(imm as u32);
-                if a & 3 != 0 { self.cop0[8] = a; { self.exception(EXC_ADES); return 0; } }
+                if a & 3 != 0 {
+                    self.cop0[8] = a;
+                    {
+                        self.exception(EXC_ADES);
+                        return 0;
+                    }
+                }
                 bus.store32(a, self.gte.read_data(rt));
             }
             _ => self.exception(EXC_RI),
@@ -681,11 +781,13 @@ impl Cpu {
         let rt = ((op >> 16) & 0x1F) as u8;
         let rd = ((op >> 11) & 0x1F) as u8;
         match rs {
-            0x00 => {                                   // MFC2
+            0x00 => {
+                // MFC2
                 let v = self.gte.read_data(rd);
                 self.load_new = (rt, v);
             }
-            0x02 => {                                   // CFC2
+            0x02 => {
+                // CFC2
                 let v = self.gte.read_ctrl(rd);
                 self.load_new = (rt, v);
             }
@@ -693,7 +795,7 @@ impl Cpu {
             0x06 => self.gte.write_ctrl(rd, self.rg(rt)), // CTC2
             _ => {
                 if rs & 0x10 != 0 {
-                    return self.gte.command(op);        // GTE command
+                    return self.gte.command(op); // GTE command
                 } else {
                     self.exception(EXC_RI);
                 }

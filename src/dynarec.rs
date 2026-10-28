@@ -5,15 +5,15 @@
 //! so they retain the interpreter's precise bus and delay-slot behavior.
 
 #[cfg(feature = "dynarec")]
-use cranelift_codegen::{
-    ir::{condcodes::IntCC, types, Function, InstBuilder, MemFlagsData, UserFuncName},
+use cranelift_codegen::ir::{
+    Function, InstBuilder, MemFlagsData, UserFuncName, condcodes::IntCC, types,
 };
 #[cfg(feature = "dynarec")]
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 #[cfg(feature = "dynarec")]
 use cranelift_jit::{JITBuilder, JITModule};
 #[cfg(feature = "dynarec")]
-use cranelift_module::{default_libcall_names, Module};
+use cranelift_module::{Module, default_libcall_names};
 
 #[cfg(feature = "dynarec")]
 type NativeOp = unsafe extern "C" fn(*mut crate::cpu::Cpu, u32);
@@ -82,7 +82,7 @@ impl Op {
             _ => return None,
         })
     }
-    
+
     fn writes_rd(self) -> bool {
         matches!(
             self,
@@ -218,7 +218,8 @@ impl Dynarec {
             .declare_anonymous_function(&signature)
             .map_err(|error| error.to_string())?;
         let mut context = module.make_context();
-        context.func = Function::with_name_signature(UserFuncName::user(0, self.next_id), signature);
+        context.func =
+            Function::with_name_signature(UserFuncName::user(0, self.next_id), signature);
         self.next_id += 1;
         let mut function_context = FunctionBuilderContext::new();
         {
@@ -244,16 +245,13 @@ impl Dynarec {
                 .brif(should_write, write_block, &[], done_block, &[]);
 
             builder.switch_to_block(write_block);
-            let reg_base = builder.ins().iadd_imm_s(
-                cpu_ptr,
-                std::mem::offset_of!(crate::cpu::Cpu, r) as i64,
-            );
+            let reg_base = builder
+                .ins()
+                .iadd_imm_s(cpu_ptr, std::mem::offset_of!(crate::cpu::Cpu, r) as i64);
             let dest_offset32 = builder.ins().ishl_imm_u(dest, 2);
             let dest_offset = builder.ins().uextend(types::I64, dest_offset32);
             let dest_ptr = builder.ins().iadd(reg_base, dest_offset);
-            builder
-                .ins()
-                .store(mem_flags, result, dest_ptr, 0);
+            builder.ins().store(mem_flags, result, dest_ptr, 0);
 
             let pending_ptr = builder.ins().iadd_imm_s(
                 cpu_ptr,
@@ -265,9 +263,7 @@ impl Dynarec {
             let same_dest = builder.ins().icmp(IntCC::Equal, pending32, dest);
             let no_pending = builder.ins().iconst(types::I8, 0);
             let next_pending = builder.ins().select(same_dest, no_pending, pending);
-            builder
-                .ins()
-                .store(mem_flags, next_pending, pending_ptr, 0);
+            builder.ins().store(mem_flags, next_pending, pending_ptr, 0);
             builder.ins().jump(done_block, &[]);
 
             builder.switch_to_block(done_block);
@@ -295,10 +291,9 @@ impl Dynarec {
         word: cranelift_codegen::ir::Value,
         mem_flags: MemFlagsData,
     ) -> cranelift_codegen::ir::Value {
-        let reg_base = builder.ins().iadd_imm_s(
-            cpu_ptr,
-            std::mem::offset_of!(crate::cpu::Cpu, r) as i64,
-        );
+        let reg_base = builder
+            .ins()
+            .iadd_imm_s(cpu_ptr, std::mem::offset_of!(crate::cpu::Cpu, r) as i64);
         let rs_bits = builder.ins().ushr_imm_u(word, 21);
         let rs = builder.ins().band_imm_u(rs_bits, 31);
         let rt_bits = builder.ins().ushr_imm_u(word, 16);

@@ -81,9 +81,7 @@ impl Disc {
 
         macro_rules! finish {
             () => {
-                if let (Some(bp), Some((au, fmt, idx))) =
-                    (cur_file.clone(), pending.take())
-                {
+                if let (Some(bp), Some((au, fmt, idx))) = (cur_file.clone(), pending.take()) {
                     if idx != u32::MAX {
                         raw.push(Raw {
                             file: bp,
@@ -101,9 +99,7 @@ impl Disc {
             let up = l.to_ascii_uppercase();
             if up.starts_with("FILE ") {
                 finish!(); // a new FILE closes any track still open
-                if let (Some(a), Some(b)) =
-                    (l.find('"').map(|i| i + 1), l.rfind('"'))
-                {
+                if let (Some(a), Some(b)) = (l.find('"').map(|i| i + 1), l.rfind('"')) {
                     cur_file = Some(dir.join(&l[a..b]));
                 }
             } else if up.starts_with("TRACK ") {
@@ -116,9 +112,7 @@ impl Disc {
                 };
                 pending = Some((audio, fmt, u32::MAX));
             } else if up.starts_with("INDEX 01") {
-                if let (Some(msf), Some((_, _, idx))) =
-                    (l.rsplit(' ').next(), pending.as_mut())
-                {
+                if let (Some(msf), Some((_, _, idx))) = (l.rsplit(' ').next(), pending.as_mut()) {
                     if let Some(v) = parse_msf(msf) {
                         *idx = v;
                     }

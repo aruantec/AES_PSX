@@ -322,7 +322,15 @@ impl Gte {
                 let rt13 = self.mat(0, 0, 2);
                 let rt22 = self.mat(0, 1, 1);
                 [
-                    -r * 16, r * 16, self.ir(0), rt13, rt13, rt13, rt22, rt22, rt22,
+                    -r * 16,
+                    r * 16,
+                    self.ir(0),
+                    rt13,
+                    rt13,
+                    rt13,
+                    rt22,
+                    rt22,
+                    rt22,
                 ]
             }
         }
@@ -331,7 +339,11 @@ impl Gte {
     /// Vector by selector: 0..2 = V0..V2, 3 = [IR1,IR2,IR3].
     fn vector(&self, v: u8) -> [i64; 3] {
         match v {
-            0..=2 => [self.v(v as usize, 0), self.v(v as usize, 1), self.v(v as usize, 2)],
+            0..=2 => [
+                self.v(v as usize, 0),
+                self.v(v as usize, 1),
+                self.v(v as usize, 2),
+            ],
             _ => [self.ir(1), self.ir(2), self.ir(3)],
         }
     }
@@ -445,12 +457,11 @@ impl Gte {
             }
             0x06 => {
                 // NCLIP
-                let m0 = self.sx(0) * self.sy(1)
-                    + self.sx(1) * self.sy(2)
-                    + self.sx(2) * self.sy(0)
-                    - self.sx(0) * self.sy(2)
-                    - self.sx(1) * self.sy(0)
-                    - self.sx(2) * self.sy(1);
+                let m0 =
+                    self.sx(0) * self.sy(1) + self.sx(1) * self.sy(2) + self.sx(2) * self.sy(0)
+                        - self.sx(0) * self.sy(2)
+                        - self.sx(1) * self.sy(0)
+                        - self.sx(2) * self.sy(1);
                 self.set_mac0(m0);
                 8
             }
@@ -627,8 +638,7 @@ impl Gte {
             }
             0x2E => {
                 // AVSZ4
-                let m0 = self.mat_zsf(1)
-                    * (self.sz(0) + self.sz(1) + self.sz(2) + self.sz(3));
+                let m0 = self.mat_zsf(1) * (self.sz(0) + self.sz(1) + self.sz(2) + self.sz(3));
                 self.set_mac0(m0);
                 let o = self.lim_u16(m0 >> 12);
                 self.data[7] = o as u32;

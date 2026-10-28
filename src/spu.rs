@@ -49,7 +49,11 @@ impl Ramp {
             return level;
         }
         let mut cycles = 1u32 << shift.saturating_sub(11);
-        let base = if dec { -8 + step as i32 } else { 7 - step as i32 };
+        let base = if dec {
+            -8 + step as i32
+        } else {
+            7 - step as i32
+        };
         let mut delta = base << 11u32.saturating_sub(shift);
         if exp && !dec && level > 0x6000 {
             cycles *= 4;
@@ -210,7 +214,8 @@ impl Spu {
             let b = self.ram[a as usize + 2 + i / 2];
             let nib = if i & 1 == 0 { b & 0xF } else { b >> 4 };
             let raw = (((nib as i8) << 4) as i32) << 8 >> shift;
-            let s = (raw + ((h1 * ADPCM_POS[f] + h2 * ADPCM_NEG[f] + 32) >> 6)).clamp(-0x8000, 0x7FFF);
+            let s =
+                (raw + ((h1 * ADPCM_POS[f] + h2 * ADPCM_NEG[f] + 32) >> 6)).clamp(-0x8000, 0x7FFF);
             vc.samples[i] = s as i16;
             h2 = h1;
             h1 = s;
@@ -255,7 +260,9 @@ impl Spu {
         match vc.phase {
             Phase::Attack => {
                 let exp = lo & 0x8000 != 0;
-                vc.level = vc.ramp.step(vc.level, exp, false, (lo >> 10) & 0x1F, (lo >> 8) & 3);
+                vc.level = vc
+                    .ramp
+                    .step(vc.level, exp, false, (lo >> 10) & 0x1F, (lo >> 8) & 3);
                 if vc.level >= 0x7FFF {
                     vc.phase = Phase::Decay;
                     vc.ramp = Ramp::default();
@@ -272,7 +279,9 @@ impl Spu {
             Phase::Sustain => {
                 let exp = hi & 0x8000 != 0;
                 let dec = hi & 0x4000 != 0;
-                vc.level = vc.ramp.step(vc.level, exp, dec, (hi >> 8) & 0x1F, (hi >> 6) & 3);
+                vc.level = vc
+                    .ramp
+                    .step(vc.level, exp, dec, (hi >> 8) & 0x1F, (hi >> 6) & 3);
             }
             Phase::Release => {
                 let exp = hi & 0x20 != 0;
@@ -293,14 +302,21 @@ impl Spu {
         // sweep mode: magnitude ramps, sign from phase bit
         let exp = reg & 0x4000 != 0;
         let dec = reg & 0x2000 != 0;
-        let mag = ramp.step(level.abs(), exp, dec, ((reg >> 2) & 0x1F) as u32, (reg & 3) as u32);
+        let mag = ramp.step(
+            level.abs(),
+            exp,
+            dec,
+            ((reg >> 2) & 0x1F) as u32,
+            (reg & 3) as u32,
+        );
         *level = if reg & 0x1000 != 0 { -mag } else { mag };
         *level
     }
 
     fn sample_voice(&mut self, v: usize, prev_out: i32) -> i32 {
         let noise = (self.regs[0xCA] as u32 | (self.regs[0xCB] as u32) << 16) & (1 << v) != 0;
-        let pmon = v > 0 && (self.regs[0xC8] as u32 | (self.regs[0xC9] as u32) << 16) & (1 << v) != 0;
+        let pmon =
+            v > 0 && (self.regs[0xC8] as u32 | (self.regs[0xC9] as u32) << 16) & (1 << v) != 0;
         let vc = &mut self.voices[v];
         if vc.phase == Phase::Off && vc.level == 0 {
             vc.out = 0;
@@ -313,7 +329,11 @@ impl Spu {
         } else {
             let at = |k: isize| -> i32 {
                 let i = idx as isize + k;
-                if i < 0 { vc.prev[(3 + i) as usize] as i32 } else { vc.samples[i as usize] as i32 }
+                if i < 0 {
+                    vc.prev[(3 + i) as usize] as i32
+                } else {
+                    vc.samples[i as usize] as i32
+                }
             };
             // 4-point cubic (Catmull-Rom) across samples idx-3..idx
             let (p0, p1, p2, p3) = (at(-3), at(-2), at(-1), at(0));
@@ -408,7 +428,12 @@ impl Spu {
         let v3 = self.voices[3].out as i16;
         self.put16(0x800 + cpos * 2, v1);
         self.put16(0xC00 + cpos * 2, v3);
-        for a in [cpos * 2, 0x400 + cpos * 2, 0x800 + cpos * 2, 0xC00 + cpos * 2] {
+        for a in [
+            cpos * 2,
+            0x400 + cpos * 2,
+            0x800 + cpos * 2,
+            0xC00 + cpos * 2,
+        ] {
             self.touch(a);
         }
         self.capture_pos = (cpos + 1) & 0x1FF;
@@ -427,8 +452,16 @@ impl Spu {
             r += or;
         }
         let mute = self.cnt & (1 << 14) == 0 || self.cnt & 0x8000 == 0;
-        let ol = if mute { 0 } else { (l.clamp(-0x8000, 0x7FFF) * self.main_vol[0]) >> 15 };
-        let or = if mute { 0 } else { (r.clamp(-0x8000, 0x7FFF) * self.main_vol[1]) >> 15 };
+        let ol = if mute {
+            0
+        } else {
+            (l.clamp(-0x8000, 0x7FFF) * self.main_vol[0]) >> 15
+        };
+        let or = if mute {
+            0
+        } else {
+            (r.clamp(-0x8000, 0x7FFF) * self.main_vol[1]) >> 15
+        };
         if self.out.len() < 44_100 {
             self.out.push(ol.clamp(-0x8000, 0x7FFF) as i16);
             self.out.push(or.clamp(-0x8000, 0x7FFF) as i16);
@@ -469,40 +502,56 @@ impl Spu {
         let ri = (self.rev_in[1] + inr) / 2;
         // register layout 0x1DC0.. (index from 0xE0)
         let (d_apf1, d_apf2) = (self.rva(0), self.rva(1));
-        let (v_iir, v_comb1, v_comb2, v_comb3, v_comb4) = (self.rv(2), self.rv(3), self.rv(4), self.rv(5), self.rv(6));
+        let (v_iir, v_comb1, v_comb2, v_comb3, v_comb4) =
+            (self.rv(2), self.rv(3), self.rv(4), self.rv(5), self.rv(6));
         let v_wall = self.rv(7);
         let (v_apf1, v_apf2) = (self.rv(8), self.rv(9));
         let (m_lsame, m_rsame) = (self.rva(10), self.rva(11));
-        let (m_lcomb1, m_rcomb1, m_lcomb2, m_rcomb2) = (self.rva(12), self.rva(13), self.rva(14), self.rva(15));
+        let (m_lcomb1, m_rcomb1, m_lcomb2, m_rcomb2) =
+            (self.rva(12), self.rva(13), self.rva(14), self.rva(15));
         let (d_lsame, d_rsame) = (self.rva(16), self.rva(17));
         let (m_ldiff, m_rdiff) = (self.rva(18), self.rva(19));
-        let (m_lcomb3, m_rcomb3, m_lcomb4, m_rcomb4) = (self.rva(20), self.rva(21), self.rva(22), self.rva(23));
+        let (m_lcomb3, m_rcomb3, m_lcomb4, m_rcomb4) =
+            (self.rva(20), self.rva(21), self.rva(22), self.rva(23));
         let (d_ldiff, d_rdiff) = (self.rva(24), self.rva(25));
-        let (m_lapf1, m_rapf1, m_lapf2, m_rapf2) = (self.rva(26), self.rva(27), self.rva(28), self.rva(29));
+        let (m_lapf1, m_rapf1, m_lapf2, m_rapf2) =
+            (self.rva(26), self.rva(27), self.rva(28), self.rva(29));
         let (v_lin, v_rin) = (self.rv(30), self.rv(31));
         let m = |a: i32, b: i32| (a * b) >> 15;
 
         let lin = m(li, v_lin);
         let rin = m(ri, v_rin);
         // same-side reflection
-        let ls = m(lin + m(self.rget(d_lsame), v_wall) - self.rget(m_lsame- 2), v_iir)
-            + self.rget(m_lsame- 2);
-        let rs = m(rin + m(self.rget(d_rsame), v_wall) - self.rget(m_rsame- 2), v_iir)
-            + self.rget(m_rsame- 2);
+        let ls = m(
+            lin + m(self.rget(d_lsame), v_wall) - self.rget(m_lsame - 2),
+            v_iir,
+        ) + self.rget(m_lsame - 2);
+        let rs = m(
+            rin + m(self.rget(d_rsame), v_wall) - self.rget(m_rsame - 2),
+            v_iir,
+        ) + self.rget(m_rsame - 2);
         self.rput(m_lsame, ls);
         self.rput(m_rsame, rs);
         // different-side reflection
-        let ld = m(lin + m(self.rget(d_rdiff), v_wall) - self.rget(m_ldiff- 2), v_iir)
-            + self.rget(m_ldiff- 2);
-        let rd = m(rin + m(self.rget(d_ldiff), v_wall) - self.rget(m_rdiff- 2), v_iir)
-            + self.rget(m_rdiff- 2);
+        let ld = m(
+            lin + m(self.rget(d_rdiff), v_wall) - self.rget(m_ldiff - 2),
+            v_iir,
+        ) + self.rget(m_ldiff - 2);
+        let rd = m(
+            rin + m(self.rget(d_ldiff), v_wall) - self.rget(m_rdiff - 2),
+            v_iir,
+        ) + self.rget(m_rdiff - 2);
         self.rput(m_ldiff, ld);
         self.rput(m_rdiff, rd);
         // early echo
-        let mut lo = m(v_comb1, self.rget(m_lcomb1)) + m(v_comb2, self.rget(m_lcomb2))
-            + m(v_comb3, self.rget(m_lcomb3)) + m(v_comb4, self.rget(m_lcomb4));
-        let mut ro = m(v_comb1, self.rget(m_rcomb1)) + m(v_comb2, self.rget(m_rcomb2))
-            + m(v_comb3, self.rget(m_rcomb3)) + m(v_comb4, self.rget(m_rcomb4));
+        let mut lo = m(v_comb1, self.rget(m_lcomb1))
+            + m(v_comb2, self.rget(m_lcomb2))
+            + m(v_comb3, self.rget(m_lcomb3))
+            + m(v_comb4, self.rget(m_lcomb4));
+        let mut ro = m(v_comb1, self.rget(m_rcomb1))
+            + m(v_comb2, self.rget(m_rcomb2))
+            + m(v_comb3, self.rget(m_rcomb3))
+            + m(v_comb4, self.rget(m_rcomb4));
         // all-pass 1
         lo -= m(v_apf1, self.rget(m_lapf1 - d_apf1));
         self.rput(m_lapf1, lo);

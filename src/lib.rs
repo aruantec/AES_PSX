@@ -16,8 +16,8 @@ pub mod bus;
 pub mod cdrom;
 pub mod cpu;
 pub mod disc;
-mod dynarec;
 pub mod dma;
+mod dynarec;
 pub mod gpu;
 pub mod gte;
 pub mod irq;
@@ -72,7 +72,15 @@ struct Video {
 
 impl Video {
     fn new() -> Self {
-        Self { frac: 0, line_pos: 0, line: 0, hblank: false, vblank: false, dot_acc: 0, field: false }
+        Self {
+            frac: 0,
+            line_pos: 0,
+            line: 0,
+            hblank: false,
+            vblank: false,
+            dot_acc: 0,
+            field: false,
+        }
     }
 }
 
@@ -172,10 +180,18 @@ impl Emulator {
     /// Fast-boot the disc's boot executable (skips the logo/shell).
     pub fn fast_boot_disc(&mut self) -> bool {
         let exe = {
-            let Some(d) = self.bus.cdrom.disc_mut() else { return false };
-            let Some(cnf) = iso::read_file(d, "SYSTEM.CNF") else { return false };
-            let Some(path) = iso::boot_path(&cnf) else { return false };
-            let Some(exe) = iso::read_file(d, &path) else { return false };
+            let Some(d) = self.bus.cdrom.disc_mut() else {
+                return false;
+            };
+            let Some(cnf) = iso::read_file(d, "SYSTEM.CNF") else {
+                return false;
+            };
+            let Some(path) = iso::boot_path(&cnf) else {
+                return false;
+            };
+            let Some(exe) = iso::read_file(d, &path) else {
+                return false;
+            };
             exe
         };
         self.set_fast_boot_exe(exe);
@@ -183,7 +199,9 @@ impl Emulator {
     }
 
     fn start_exe(&mut self, exe: &[u8]) -> bool {
-        let Some(info) = iso::parse_exe(exe) else { return false };
+        let Some(info) = iso::parse_exe(exe) else {
+            return false;
+        };
         let data = &exe[info.data_off.min(exe.len())..];
         let n = (info.load_size as usize).min(data.len());
         let base = info.load_addr & 0x1F_FFFF;
@@ -293,8 +311,7 @@ impl Emulator {
             self.start_exe(&exe.data);
         }
         let n = if USE_DYNAREC {
-            self.cpu
-                .step_with_dynarec(&mut self.bus, &mut self.dynarec)
+            self.cpu.step_with_dynarec(&mut self.bus, &mut self.dynarec)
         } else {
             self.cpu.step(&mut self.bus)
         };
@@ -427,11 +444,19 @@ impl Emulator {
             let gpu = &mut self.bus.gpu;
             let (mut top, mut bot) = (gpu.v_range.0 as u32, gpu.v_range.1 as u32);
             if bot <= top || bot > lines {
-                (top, bot) = if pal { (0x23, 0x23 + 288) } else { (0x10, 0x100) };
+                (top, bot) = if pal {
+                    (0x23, 0x23 + 288)
+                } else {
+                    (0x10, 0x100)
+                };
             }
             let in_vb = v.line < top || v.line >= bot;
             gpu.field_odd = gpu.interlaced() && v.field;
-            gpu.odd_line = if gpu.interlaced() { v.field } else { v.line & 1 != 0 };
+            gpu.odd_line = if gpu.interlaced() {
+                v.field
+            } else {
+                v.line & 1 != 0
+            };
             if in_vb != v.vblank {
                 v.vblank = in_vb;
                 gpu.vblank = in_vb;
@@ -491,10 +516,16 @@ impl Emulator {
             return None;
         }
         let mut a = c.madr & 0x1F_FFFC;
-        let rd = |b: &Bus, a: u32| u32::from_le_bytes(b.ram[a as usize..a as usize + 4].try_into().unwrap());
+        let rd = |b: &Bus, a: u32| {
+            u32::from_le_bytes(b.ram[a as usize..a as usize + 4].try_into().unwrap())
+        };
         for i in 0..words {
             if ch == 6 {
-                let v = if i + 1 == words { 0xFF_FFFF } else { a.wrapping_sub(4) & 0x1F_FFFF };
+                let v = if i + 1 == words {
+                    0xFF_FFFF
+                } else {
+                    a.wrapping_sub(4) & 0x1F_FFFF
+                };
                 b.ram[a as usize..a as usize + 4].copy_from_slice(&v.to_le_bytes());
             } else if c.to_ram() {
                 let v = match ch {

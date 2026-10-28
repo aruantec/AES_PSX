@@ -37,12 +37,15 @@ impl Channel {
     }
 
     pub fn step(&self) -> u32 {
-        if self.chcr & 2 != 0 { (-4i32) as u32 } else { 4 }
+        if self.chcr & 2 != 0 {
+            (-4i32) as u32
+        } else {
+            4
+        }
     }
 
     fn startable(&self) -> bool {
-        self.chcr & (1 << 24) != 0
-            && (self.mode() != Mode::Burst || self.chcr & (1 << 28) != 0)
+        self.chcr & (1 << 24) != 0 && (self.mode() != Mode::Burst || self.chcr & (1 << 28) != 0)
     }
 }
 
@@ -106,7 +109,11 @@ impl Dma {
                     0 => self.ch[i].madr = v & 0xFF_FFFF,
                     4 => self.ch[i].bcr = v,
                     8 => {
-                        let v = if i == 6 { (v & 0x5100_0000) | 2 } else { v & 0x7177_0703 };
+                        let v = if i == 6 {
+                            (v & 0x5100_0000) | 2
+                        } else {
+                            v & 0x7177_0703
+                        };
                         self.ch[i].chcr = v;
                         self.check(i);
                     }
@@ -117,9 +124,7 @@ impl Dma {
     }
 
     fn check(&mut self, i: usize) {
-        if self.finishing[i].is_none()
-            && self.ch[i].startable()
-            && (self.dpcr >> (i * 4)) & 8 != 0
+        if self.finishing[i].is_none() && self.ch[i].startable() && (self.dpcr >> (i * 4)) & 8 != 0
         {
             self.pending |= 1 << i;
         }

@@ -73,6 +73,8 @@ pub struct HwPrim {
     pub pad2: u16,
     /// draw-area clip, native coords, inclusive: x0,y0,x1,y1
     pub clip: [i16; 4],
+    /// Primitive texture-coordinate bounds, inclusive in native texels.
+    pub uv_bounds: [i16; 4],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -80,11 +82,21 @@ pub enum HwOp {
     /// CPU-side VRAM write (upload, blit, fill): upload the rect to the
     /// backend's native VRAM texture AND resolve it into the scaled
     /// surface nearest-neighbour — it displays as native-res content.
-    Resolve { x0: u16, y0: u16, x1: u16, y1: u16 },
+    Resolve {
+        x0: u16,
+        y0: u16,
+        x1: u16,
+        y1: u16,
+    },
     /// Native texture data changed under rasterization: upload the rect
     /// to the native VRAM texture only (framebuffer-as-texture feedback)
     /// — must NOT resolve into the scaled surface.
-    Upload { x0: u16, y0: u16, x1: u16, y1: u16 },
+    Upload {
+        x0: u16,
+        y0: u16,
+        x1: u16,
+        y1: u16,
+    },
     Prim(HwPrim),
 }
 
@@ -748,6 +760,7 @@ impl Gpu {
         let (cx0, cy0, cx1, cy1) = self.clip();
         let mut hv = [HwVert::default(); 4];
         let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        let (mut u0, mut v0, mut u1, mut v1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
         for (i, vert) in v.iter().enumerate().take(4) {
             hv[i] = HwVert {
                 x: vert.x as i16,
@@ -763,6 +776,16 @@ impl Gpu {
             x1 = x1.max(vert.x);
             y0 = y0.min(vert.y);
             y1 = y1.max(vert.y);
+            u0 = u0.min(vert.u);
+            v0 = v0.min(vert.v);
+            u1 = u1.max(vert.u);
+            v1 = v1.max(vert.v);
+        }
+        // Rect vertex UVs describe texel-boundary corners; the covered
+        // texel centers stop one before the high boundary.
+        if extra & hw_flags::RECT != 0 {
+            u1 = u1.saturating_sub(1);
+            v1 = v1.saturating_sub(1);
         }
         let mut flags = extra;
         flags |= hw_flags::TEXTURED * sh.textured as u16
@@ -787,12 +810,8 @@ impl Gpu {
             col: self.gp0_cmd & 0xFF_FFFF,
             flags,
             pad2: 0,
-            clip: [
-                cx0 as i16,
-                cy0 as i16,
-                (cx1 + 1) as i16,
-                (cy1 + 1) as i16,
-            ],
+            clip: [cx0 as i16, cy0 as i16, (cx1 + 1) as i16, (cy1 + 1) as i16],
+            uv_bounds: [u0 as i16, v0 as i16, u1 as i16, v1 as i16],
         }));
         self.dirty_raster_rect(x0, y0, x1, y1);
     }
@@ -1269,30 +1288,30 @@ impl Gpu {
         let xflip = self.regs[1] & (1 << 12) != 0;
         let yflip = self.regs[1] & (1 << 13) != 0;
         if self.hw_render {
-            // corners TL,TR,BR,BL; verts[0] carries raw u0/v0, the
+            // corners TL,TR,BL,BR; verts[0] carries raw u0/v0, the
             // backend derives per-corner UVs incl. flips (RECT flag)
-            let mk = |x: i32, y: i32| Vert {
+            let (u0x, u1x) = if xflip { (u0 + w, u0) } else { (u0, u0 + w) };
+            let (v0y, v1y) = if yflip { (v0 + h, v0) } else { (v0, v0 + h) };
+            let mk = |x: i32, y: i32, u: i32, v: i32| Vert {
                 x,
                 y,
-                u: u0,
-                v: v0,
+                u,
+                v,
                 r: (col & 0xFF) as i32,
                 g: ((col >> 8) & 0xFF) as i32,
                 b: ((col >> 16) & 0xFF) as i32,
             };
             let v = [
-                mk(x, y),
-                mk(x + w, y),
-                mk(x + w, y + h),
-                mk(x, y + h),
+                mk(x, y, u0x, v0y),
+                mk(x + w, y, u1x, v0y),
+                mk(x, y + h, u0x, v1y),
+                mk(x + w, y + h, u1x, v1y),
             ];
             self.record_prim(
                 &v,
                 4,
                 &sh,
-                hw_flags::RECT
-                    | hw_flags::XFLIP * xflip as u16
-                    | hw_flags::YFLIP * yflip as u16,
+                hw_flags::RECT | hw_flags::XFLIP * xflip as u16 | hw_flags::YFLIP * yflip as u16,
             );
         }
         let (cx0, cy0, cx1, cy1) = self.clip();
@@ -2064,6 +2083,79 @@ mod tests {
             let row = &g.hires_vram[y * w..(y + 1) * w];
             assert!(row.iter().any(|&p| p == 0x001F), "row {y} has no coverage");
         }
+    }
+
+    #[test]
+    fn hardware_rect_records_cyclic_quad_vertex_order() {
+        let mut g = gpu();
+        assert!(g.set_internal_scale(2));
+        g.set_hw_render(true);
+        g.gp0(0x6000_00FF); // variable-size flat rect
+        g.gp0((20 << 16) | 10);
+        g.gp0((7 << 16) | 13);
+        let prim = g
+            .take_hw_ops()
+            .into_iter()
+            .find_map(|op| match op {
+                HwOp::Prim(p) => Some(p),
+                _ => None,
+            })
+            .expect("recorded rectangle");
+        assert_eq!(prim.n, 4);
+        assert_eq!(
+            prim.verts[..4]
+                .iter()
+                .map(|v| (v.x, v.y))
+                .collect::<Vec<_>>(),
+            [(10, 20), (23, 20), (10, 27), (23, 27)]
+        );
+    }
+
+    #[test]
+    fn hardware_textured_rect_records_inclusive_filter_bounds() {
+        let mut g = gpu();
+        assert!(g.set_internal_scale(2));
+        g.set_hw_render(true);
+        g.gp0(0x6400_00FF); // variable textured rectangle
+        g.gp0((20 << 16) | 10);
+        g.gp0((9 << 8) | 5); // UV origin
+        g.gp0((7 << 16) | 13);
+        let prim = g
+            .take_hw_ops()
+            .into_iter()
+            .find_map(|op| match op {
+                HwOp::Prim(p) => Some(p),
+                _ => None,
+            })
+            .expect("recorded textured rectangle");
+        assert_eq!(prim.uv_bounds, [5, 9, 17, 15]);
+        assert_eq!(
+            prim.verts[..4]
+                .iter()
+                .map(|v| (v.u, v.v))
+                .collect::<Vec<_>>(),
+            [(5, 9), (18, 9), (5, 16), (18, 16)]
+        );
+    }
+
+    #[test]
+    fn hardware_fill_records_native_resolve() {
+        let mut g = gpu();
+        assert!(g.set_internal_scale(2));
+        g.set_hw_render(true);
+        // GP0 fill at (16,12), aligned 16x2.
+        g.gp0(0x0200_FFFF);
+        g.gp0((12 << 16) | 16);
+        g.gp0((2 << 16) | 16);
+        assert!(g.take_hw_ops().iter().any(|op| matches!(
+            op,
+            HwOp::Resolve {
+                x0: 16,
+                y0: 12,
+                x1: 32,
+                y1: 14
+            }
+        )));
     }
 
     #[test]

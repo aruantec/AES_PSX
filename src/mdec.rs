@@ -18,9 +18,9 @@ use std::collections::VecDeque;
 
 /// Scan position k → matrix index (standard 8x8 zig-zag order).
 const ZIGZAG: [usize; 64] = [
-    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27,
-    20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58,
-    59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -157,7 +157,11 @@ impl Mdec {
         if self.remaining == 0 {
             match self.state {
                 State::QuantTable => {
-                    let bytes: Vec<u8> = self.table_buf.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    let bytes: Vec<u8> = self
+                        .table_buf
+                        .iter()
+                        .flat_map(|w| w.to_le_bytes())
+                        .collect();
                     self.quant_y.copy_from_slice(&bytes[..64]);
                     if bytes.len() >= 128 {
                         self.quant_c.copy_from_slice(&bytes[64..128]);
@@ -264,7 +268,9 @@ impl Mdec {
 
     fn mono_block(&mut self) -> bool {
         let q = self.quant_y;
-        let Some(y) = self.take_block(&q) else { return false };
+        let Some(y) = self.take_block(&q) else {
+            return false;
+        };
         let signed = self.cmd & (1 << 26) != 0;
         let px: Vec<u8> = y
             .iter()
@@ -275,7 +281,8 @@ impl Mdec {
             .collect();
         if self.depth() == 1 {
             for c in px.chunks_exact(4) {
-                self.out.push_back(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                self.out
+                    .push_back(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
             }
         } else {
             for c in px.chunks_exact(8) {
@@ -307,7 +314,11 @@ impl Mdec {
         }
         let (cr, cb) = (&blocks[0], &blocks[1]);
         let signed = self.cmd & (1 << 26) != 0;
-        let bit15 = if self.cmd & (1 << 25) != 0 { 0x8000u16 } else { 0 };
+        let bit15 = if self.cmd & (1 << 25) != 0 {
+            0x8000u16
+        } else {
+            0
+        };
         let mut rgb = [[0u8; 3]; 256];
         for (bi, yb) in blocks[2..].iter().enumerate() {
             let (bx, by) = ((bi & 1) * 8, (bi >> 1) * 8);
@@ -330,13 +341,20 @@ impl Mdec {
         if self.depth() == 2 {
             let bytes: Vec<u8> = rgb.iter().flatten().copied().collect();
             for c in bytes.chunks_exact(4) {
-                self.out.push_back(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                self.out
+                    .push_back(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
             }
         } else {
             let px: Vec<u16> = rgb
                 .iter()
                 .map(|p| {
-                    let c = |v: u8| ((if signed { (v as i8 as i32 + 128) as u8 } else { v }) >> 3) as u16;
+                    let c = |v: u8| {
+                        ((if signed {
+                            (v as i8 as i32 + 128) as u8
+                        } else {
+                            v
+                        }) >> 3) as u16
+                    };
                     c(p[0]) | c(p[1]) << 5 | c(p[2]) << 10 | bit15
                 })
                 .collect();

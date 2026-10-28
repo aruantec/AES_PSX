@@ -62,7 +62,8 @@ impl State {
     }
 
     pub fn apply(emu: &mut crate::Emulator, st: &Self) {
-        emu.cpu.load_regs(st.r, st.hi, st.lo, st.pc, st.next_pc, st.cop0);
+        emu.cpu
+            .load_regs(st.r, st.hi, st.lo, st.pc, st.next_pc, st.cop0);
         emu.cpu.gte.data = st.gte_data;
         emu.cpu.gte.ctrl = st.gte_ctrl;
         emu.cpu.gte.mac = st.gte_mac;
@@ -152,8 +153,19 @@ impl State {
         let irq_stat = u16::from_le_bytes(take(2)?.try_into().ok()?);
         let irq_mask = u16::from_le_bytes(take(2)?.try_into().ok()?);
         Some(Self {
-            r, hi, lo, pc, next_pc, cop0, gte_data, gte_ctrl, gte_mac,
-            ram, scratch, irq_stat, irq_mask,
+            r,
+            hi,
+            lo,
+            pc,
+            next_pc,
+            cop0,
+            gte_data,
+            gte_ctrl,
+            gte_mac,
+            ram,
+            scratch,
+            irq_stat,
+            irq_mask,
         })
     }
 }

@@ -32,8 +32,7 @@ fn dir_entry(sec: &[u8], off: usize) -> Option<(Entry, usize)> {
     let size = le32(&sec[off + 10..off + 14]);
     let flags = sec[off + 25];
     let name_len = sec[off + 32] as usize;
-    let name = String::from_utf8_lossy(&sec[off + 33..off + 33 + name_len])
-        .into_owned();
+    let name = String::from_utf8_lossy(&sec[off + 33..off + 33 + name_len]).into_owned();
     Some((
         Entry {
             name,

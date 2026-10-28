@@ -276,7 +276,16 @@ impl Sio {
             ack_level: false,
             irq_flag: false,
             pending_irq: false,
-            pads: [Pad { pos: 0, buttons: 0xFFFF }, Pad { pos: 0, buttons: 0xFFFF }],
+            pads: [
+                Pad {
+                    pos: 0,
+                    buttons: 0xFFFF,
+                },
+                Pad {
+                    pos: 0,
+                    buttons: 0xFFFF,
+                },
+            ],
             cards: [Card::new(), Card::new()],
             pad_connected: [true, false],
             card_inserted: [true, false],

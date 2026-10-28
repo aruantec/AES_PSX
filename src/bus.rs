@@ -102,7 +102,11 @@ impl Bus {
 
     #[inline]
     pub fn phys(vaddr: u32) -> u32 {
-        if vaddr >> 29 >= 6 { vaddr } else { vaddr & 0x1FFF_FFFF }
+        if vaddr >> 29 >= 6 {
+            vaddr
+        } else {
+            vaddr & 0x1FFF_FFFF
+        }
     }
 
     #[inline]
@@ -232,7 +236,9 @@ impl Bus {
     fn write(&mut self, p: u32, v: u32, w: W) {
         match p {
             _ if p < 0x0080_0000 => Self::mem_write(&mut self.ram, (p & 0x1F_FFFF) as usize, v, w),
-            0x1F80_0000..=0x1F80_03FF => Self::mem_write(&mut self.scratch, (p & 0x3FF) as usize, v, w),
+            0x1F80_0000..=0x1F80_03FF => {
+                Self::mem_write(&mut self.scratch, (p & 0x3FF) as usize, v, w)
+            }
             0x1F80_1000..=0x1F80_2FFF => self.io_write(p, v, w),
             0xFFFE_0130 => self.cache_control = v,
             _ => {}
@@ -259,7 +265,11 @@ impl Bus {
                     self.sio.read(p) | self.sio.read(p + 2) << 16
                 } else {
                     let v = self.sio.read(p & !1);
-                    if w == W::B && p & 1 != 0 { (v >> 8) & 0xFF } else { v }
+                    if w == W::B && p & 1 != 0 {
+                        (v >> 8) & 0xFF
+                    } else {
+                        v
+                    }
                 }
             }
             0x1F80_1070..=0x1F80_1073 => narrow(self.irq.stat()),

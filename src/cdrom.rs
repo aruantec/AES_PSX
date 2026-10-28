@@ -83,7 +83,10 @@ impl CdAudio {
 
     fn push(&mut self, l: i32, r: i32) {
         if self.fifo.len() < 44_100 / 2 {
-            self.fifo.push_back((l.clamp(-0x8000, 0x7FFF) as i16, r.clamp(-0x8000, 0x7FFF) as i16));
+            self.fifo.push_back((
+                l.clamp(-0x8000, 0x7FFF) as i16,
+                r.clamp(-0x8000, 0x7FFF) as i16,
+            ));
         }
     }
 
@@ -214,7 +217,11 @@ impl CdRom {
     }
 
     fn sector_period(&self) -> u64 {
-        if self.mode & 0x80 != 0 { SECTOR_1X / 2 } else { SECTOR_1X }
+        if self.mode & 0x80 != 0 {
+            SECTOR_1X / 2
+        } else {
+            SECTOR_1X
+        }
     }
 
     /// Absolute disc LBA (relative to 00:02:00) → disc-image LBA.
@@ -231,7 +238,10 @@ impl CdRom {
     }
 
     fn track_count(&self) -> u32 {
-        self.disc.as_ref().map(|d| d.tracks.len() as u32).unwrap_or(0)
+        self.disc
+            .as_ref()
+            .map(|d| d.tracks.len() as u32)
+            .unwrap_or(0)
     }
 
     fn disc_end(&self) -> u32 {
@@ -239,7 +249,13 @@ impl CdRom {
     }
 
     fn push(&mut self, at: u64, int: u8, bytes: Vec<u8>, asynch: bool) {
-        self.queue.push_back(Reply { at, int, bytes, sector: None, asynch });
+        self.queue.push_back(Reply {
+            at,
+            int,
+            bytes,
+            sector: None,
+            asynch,
+        });
     }
 
     fn abort_async(&mut self) {
@@ -300,14 +316,19 @@ impl CdRom {
         let filter = self.mode & 0x08 != 0;
         let is_audio = submode & 0x04 != 0 && sec[15] == 2;
         if xa_enabled && is_audio {
-            if !self.adp_mute && (!filter || (file == self.filter_file && chan == self.filter_chan)) {
+            if !self.adp_mute && (!filter || (file == self.filter_file && chan == self.filter_chan))
+            {
                 self.decode_xa(&sec);
             }
             return;
         }
         self.last_hdr.copy_from_slice(&sec[12..20]);
         // newer sector replaces an undelivered older one
-        if let Some(pos) = self.queue.iter().position(|r| r.int == 1 && r.sector.is_some()) {
+        if let Some(pos) = self
+            .queue
+            .iter()
+            .position(|r| r.int == 1 && r.sector.is_some())
+        {
             self.queue.remove(pos);
         }
         self.queue.push_back(Reply {
@@ -405,7 +426,10 @@ impl CdRom {
             }
         }
         let frames: Vec<(i32, i32)> = if stereo {
-            left.iter().zip(right.iter()).map(|(&l, &r)| (l, r)).collect()
+            left.iter()
+                .zip(right.iter())
+                .map(|(&l, &r)| (l, r))
+                .collect()
         } else {
             left.iter().map(|&s| (s, s)).collect()
         };
@@ -426,8 +450,16 @@ impl CdRom {
     }
 
     fn start_read(&mut self, now: u64) {
-        let target = if self.loc_pending { self.loc } else { self.head };
-        let seek = if self.loc_pending { self.seek_time(target) } else { 0 };
+        let target = if self.loc_pending {
+            self.loc
+        } else {
+            self.head
+        };
+        let seek = if self.loc_pending {
+            self.seek_time(target)
+        } else {
+            0
+        };
         self.loc_pending = false;
         self.head = target;
         self.reading = true;
@@ -443,7 +475,8 @@ impl CdRom {
         let params: Vec<u8> = self.params.drain(..).collect();
         let p = |i: usize| params.get(i).copied().unwrap_or(0);
         let t = now + ACK_DELAY;
-        let needs_disc = matches!(cmd, 0x02..=0x09 | 0x0B..=0x0D | 0x10..=0x16 | 0x1A | 0x1B | 0x1D | 0x1E);
+        let needs_disc =
+            matches!(cmd, 0x02..=0x09 | 0x0B..=0x0D | 0x10..=0x16 | 0x1A | 0x1B | 0x1D | 0x1E);
         if needs_disc && self.disc.is_none() {
             self.push(t, 5, vec![0x11, 0x80], false);
             return;
@@ -452,7 +485,8 @@ impl CdRom {
         match cmd {
             0x01 => self.push(t, 3, vec![stat], false),
             0x02 => {
-                self.loc = (unbcd(p(0)) * 4500 + unbcd(p(1)) * 75 + unbcd(p(2))).saturating_sub(150);
+                self.loc =
+                    (unbcd(p(0)) * 4500 + unbcd(p(1)) * 75 + unbcd(p(2))).saturating_sub(150);
                 self.loc_pending = true;
                 self.push(t, 3, vec![stat], false);
             }
@@ -500,7 +534,11 @@ impl CdRom {
                 self.stat &= !(ST_READ | ST_PLAY | ST_SEEK);
                 self.push(t, 3, vec![self.stat], false);
                 self.stat &= !ST_MOTOR;
-                let d = if stat & ST_MOTOR != 0 { 0x0D38ACA } else { 0x0001D7B };
+                let d = if stat & ST_MOTOR != 0 {
+                    0x0D38ACA
+                } else {
+                    0x0001D7B
+                };
                 self.push(t + d, 2, vec![self.stat], true);
             }
             0x09 => {
@@ -545,14 +583,24 @@ impl CdRom {
                 self.mode = p(0);
                 self.push(t, 3, vec![stat], false);
             }
-            0x0F => self.push(t, 3, vec![stat, self.mode, 0, self.filter_file, self.filter_chan], false),
+            0x0F => self.push(
+                t,
+                3,
+                vec![stat, self.mode, 0, self.filter_file, self.filter_chan],
+                false,
+            ),
             0x10 => self.push(t, 3, self.last_hdr.to_vec(), false),
             0x11 => {
                 let lba = self.head;
                 let (tn, tstart) = self.track_of(lba);
                 let rel = msf(lba.saturating_sub(tstart));
                 let abs = msf(lba + 150);
-                self.push(t, 3, vec![bcd(tn), 1, rel[0], rel[1], rel[2], abs[0], abs[1], abs[2]], false);
+                self.push(
+                    t,
+                    3,
+                    vec![bcd(tn), 1, rel[0], rel[1], rel[2], abs[0], abs[1], abs[2]],
+                    false,
+                );
             }
             0x12 => {
                 self.push(t, 3, vec![stat], false);
@@ -594,10 +642,20 @@ impl CdRom {
                 self.push(t, 3, vec![stat], false);
                 let audio_only = self.disc.as_ref().map(|d| d.is_audio(0)).unwrap_or(false);
                 if audio_only {
-                    self.push(t + SECOND_DELAY, 5, vec![stat | 0x08, 0x90, 0, 0, 0, 0, 0, 0], true);
+                    self.push(
+                        t + SECOND_DELAY,
+                        5,
+                        vec![stat | 0x08, 0x90, 0, 0, 0, 0, 0, 0],
+                        true,
+                    );
                 } else {
                     let r = self.region;
-                    self.push(t + SECOND_DELAY, 2, vec![stat, 0x00, 0x20, 0x00, b'S', b'C', b'E', r], true);
+                    self.push(
+                        t + SECOND_DELAY,
+                        2,
+                        vec![stat, 0x00, 0x20, 0x00, b'S', b'C', b'E', r],
+                        true,
+                    );
                 }
             }
             0x1C => {
@@ -667,8 +725,13 @@ impl CdRom {
             (3, 0) => {
                 if v & 0x80 != 0 {
                     if self.data.is_empty() {
-                        let (off, len) = if self.mode & 0x20 != 0 { (12, 2340) } else { (24, 2048) };
-                        self.data.extend(self.sector[off..off + len].iter().copied());
+                        let (off, len) = if self.mode & 0x20 != 0 {
+                            (12, 2340)
+                        } else {
+                            (24, 2048)
+                        };
+                        self.data
+                            .extend(self.sector[off..off + len].iter().copied());
                     }
                 } else {
                     self.data.clear();
