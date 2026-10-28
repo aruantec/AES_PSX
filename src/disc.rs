@@ -41,6 +41,9 @@ pub struct Disc {
     files: Vec<File>,
     /// `file_of[i]` indexes `files` for `tracks[i]`.
     file_of: Vec<usize>,
+    /// Diagnostics: sectors read and cumulative time spent in file IO.
+    pub sector_reads: u64,
+    pub sector_io_ns: u64,
 }
 
 impl Disc {
@@ -62,6 +65,8 @@ impl Disc {
                 }],
                 files: vec![f],
                 file_of: vec![0],
+                sector_reads: 0,
+                sector_io_ns: 0,
             });
         }
 
@@ -166,6 +171,8 @@ impl Disc {
             tracks,
             files: fvec,
             file_of,
+            sector_reads: 0,
+            sector_io_ns: 0,
         })
     }
 
@@ -205,6 +212,8 @@ impl Disc {
         let mut buf = [0u8; SECTOR_RAW];
         let cooked = track.sector_size == SECTOR_DATA;
         let f = &mut self.files[fi];
+        self.sector_reads += 1;
+        let io_started = std::time::Instant::now();
         f.seek(SeekFrom::Start(off)).ok()?;
         if cooked {
             // 2048-byte image: synthesize a MODE2/form1 frame around
@@ -219,9 +228,11 @@ impl Disc {
             buf[15] = 2;
             buf[18] = 0x08;
             buf[22] = 0x08;
+            self.sector_io_ns += io_started.elapsed().as_nanos() as u64;
             return Some(buf);
         }
         f.read_exact(&mut buf).ok()?;
+        self.sector_io_ns += io_started.elapsed().as_nanos() as u64;
         Some(buf)
     }
 

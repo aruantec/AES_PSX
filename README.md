@@ -40,21 +40,26 @@ value such as `3840x2160` selects the nearest supported scale. For a
 typical 512x240 game mode, `3840x2160` selects `8x`.
 `--window-size=WIDTHxHEIGHT` changes only the window. `--sw` forces
 software rendering, `--fast` skips the BIOS shell, and `--dynarec`
-enables the experimental CPU translator. `--texture-filter=nearest`
+enables the experimental CPU translator. `--mute` runs silently for
+visual/performance checks. `--texture-filter=nearest`
 or `--texture-filter=bilinear` selects polygon texture filtering.
+Nearest is the default to keep FF9 dialogue and other low-resolution text
+crisp. The CRT presentation effect adds restrained scanlines and an RGB
+phosphor mask after rendering; use `--crt=off` to disable it, or press
+`C` to toggle it while playing.
 
 Controls: arrows = D-pad; Z/X/A/S = Cross/Circle/Square/Triangle;
 Q/W = L1/R1; E/R = L2/R2; Enter = Start; Backspace = Select;
 Tab = fast-forward; Esc = quit. `F` toggles display scaling
-(smooth/sharp), `T` toggles polygon texture filtering, and `D`
-toggles PS1 dithering. Gamepads are also supported.
+(smooth/sharp), `T` toggles polygon texture filtering, `C` toggles the
+CRT presentation effect, and `D` toggles PS1 dithering. Gamepads are
+also supported.
 
-Nearest texture sampling preserves the PS1 look. Bilinear filtering
-filters decoded texture colors while clamping samples to each
-primitive's UV bounds; it smooths low-resolution textures but can
-soften pixel-art details. At `4x`, `6x`, and `8x`, bilinear is selected by
-default; use `--texture-filter=nearest` or press `T` to change it.
-`F` affects only final display scaling.
+Nearest texture sampling preserves the original pixel edges. Bilinear
+filtering remains available and smooths decoded texture colors while
+clamping samples to each primitive's UV bounds, but it can soften
+pixel-art details. The CRT effect is separate from texture sampling, so
+it does not blur dialogue fonts.
 
 The hardware renderer rasterizes polygons on the host GPU. FSR 3/4 is
 not used: temporal upscalers need motion vectors and frame history

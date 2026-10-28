@@ -26,7 +26,7 @@ use winit::{
 
 const DEFAULT_BIOS: &str = "F:/Games/Emulators/Playstation/PSX/Duckstation/Bios/SCPH1001.BIN";
 const SRC_RATE: f64 = 44_100.0;
-const AUDIO_RING_CAP: usize = 16_384;
+const AUDIO_RING_CAP: usize = 65_536;
 const AUDIO_RING_MASK: usize = AUDIO_RING_CAP - 1;
 
 /// Single-producer/single-consumer audio FIFO. The emulation thread is
@@ -100,7 +100,9 @@ fn start_audio(queue: AudioQueue) -> Option<cpal::Stream> {
     let rate = cfg.sample_rate().0;
     let channels = cfg.channels() as usize;
     let nominal_step = SRC_RATE / rate as f64;
-    let target_fill = 4 * 735; // about 67 ms of NTSC audio safety buffer
+    // Match FRAME_AUDIO_CUSHION: about 200 ms of NTSC audio, enough for
+    // the worst one-time boot bursts (~135 ms) to pass without an underrun.
+    let target_fill = 12 * 735;
     let (mut pos, mut cur, mut next) = (0.0f64, (0i16, 0i16), (0i16, 0i16));
     let mut primed = false;
     let mut step = nominal_step;
@@ -292,6 +294,77 @@ fn parse_texture_filter(value: &str) -> Result<bool, String> {
     }
 }
 
+fn parse_crt_filter(value: &str) -> Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err("expected on or off".into()),
+    }
+}
+
+fn frame_deadline_needs_poll(now: Instant, deadline: Instant, guard: Duration) -> bool {
+    deadline.saturating_duration_since(now) <= guard
+}
+
+/// How far behind the wall clock the frame grid may fall before we give
+/// up on repaying the debt outright (long modal drags, debugger pauses).
+const MAX_FRAME_DEBT: Duration = Duration::from_millis(400);
+/// Startup/resync cushion: seeds enough owed frames to build ~200 ms of
+/// audio ahead of consumption so one-time boot bursts can't starve the
+/// output device.
+const FRAME_AUDIO_CUSHION: Duration = Duration::from_millis(200);
+
+/// Advance the frame deadline on a fixed grid so a late frame is repaid
+/// by running the next frames back-to-back (the emulator headroom turns
+/// the spike into buffered audio instead of an underrun). If the grid is
+/// hopelessly behind, resync to a bounded catch-up burst.
+fn advance_frame_deadline(next_frame: Instant, period: Duration, now: Instant) -> Instant {
+    let next = next_frame + period;
+    if next + MAX_FRAME_DEBT < now {
+        now.checked_sub(FRAME_AUDIO_CUSHION).unwrap_or(now)
+    } else {
+        next
+    }
+}
+
+/// Reseed the frame grid after a long stall (or at startup) so the next
+/// frames run immediately and rebuild the audio cushion.
+fn seeded_frame_deadline(now: Instant) -> Instant {
+    now.checked_sub(FRAME_AUDIO_CUSHION).unwrap_or(now)
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "winmm")]
+unsafe extern "system" {
+    fn timeBeginPeriod(period: u32) -> u32;
+    fn timeEndPeriod(period: u32) -> u32;
+}
+
+struct FrameTimerResolution {
+    requested: bool,
+}
+
+impl FrameTimerResolution {
+    fn request() -> Self {
+        #[cfg(target_os = "windows")]
+        let requested = unsafe { timeBeginPeriod(1) == 0 };
+        #[cfg(not(target_os = "windows"))]
+        let requested = false;
+        Self { requested }
+    }
+}
+
+impl Drop for FrameTimerResolution {
+    fn drop(&mut self) {
+        #[cfg(target_os = "windows")]
+        if self.requested {
+            unsafe {
+                timeEndPeriod(1);
+            }
+        }
+    }
+}
+
 struct GpuPresenter {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -300,6 +373,7 @@ struct GpuPresenter {
     pipeline: wgpu::RenderPipeline,
     bind_linear: wgpu::BindGroup,
     bind_nearest: wgpu::BindGroup,
+    crt_uniform: wgpu::Buffer,
     source_texture: wgpu::Texture,
     source_view: wgpu::TextureView,
     rgba: Vec<u8>,
@@ -365,7 +439,23 @@ impl GpuPresenter {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
+        });
+        let crt_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("PSX CRT presentation settings"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("PSX display scaler"),
@@ -393,8 +483,22 @@ impl GpuPresenter {
                 }
                 @group(0) @binding(0) var image: texture_2d<f32>;
                 @group(0) @binding(1) var image_sampler: sampler;
+                struct CrtSettings { enabled: f32, scale: f32, pad0: f32, pad1: f32 }
+                @group(0) @binding(2) var<uniform> crt: CrtSettings;
                 @fragment fn fs(in: Out) -> @location(0) vec4<f32> {
-                    return textureSample(image, image_sampler, in.uv);
+                    let sample = textureSample(image, image_sampler, in.uv);
+                    if crt.enabled < 0.5 { return sample; }
+                    let dims = vec2<f32>(textureDimensions(image));
+                    let source = in.uv * dims / crt.scale;
+                    let line_phase = fract(source.y);
+                    let line = 0.90 + 0.10 * (1.0 - abs(2.0 * line_phase - 1.0));
+                    let phase = u32(floor(source.x * 3.0)) % 3u;
+                    let mask = vec3<f32>(
+                        select(0.965, 1.0, phase == 0u),
+                        select(0.965, 1.0, phase == 1u),
+                        select(0.965, 1.0, phase == 2u),
+                    );
+                    return vec4<f32>(sample.rgb * mask * line, sample.a);
                 }
                 "#
                 .into(),
@@ -472,6 +576,10 @@ impl GpuPresenter {
                         binding: 1,
                         resource: wgpu::BindingResource::Sampler(s),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: crt_uniform.as_entire_binding(),
+                    },
                 ],
             })
         };
@@ -486,6 +594,7 @@ impl GpuPresenter {
             pipeline,
             bind_linear,
             bind_nearest,
+            crt_uniform,
             source_texture,
             source_view,
             rgba: Vec::new(),
@@ -512,16 +621,7 @@ impl GpuPresenter {
 
     /// Hardware-rendered frame: replay ops into the scaled target and
     /// present its display crop — the CPU path is bypassed entirely.
-    fn render_hw(
-        &mut self,
-        window: &Window,
-        ops: &[HwOp],
-        vram: &[u16],
-        crop: (u32, u32, u32, u32),
-        smooth: bool,
-        replay_frame: bool,
-        texture_filter: bool,
-    ) {
+    fn render_hw(&mut self, window: &Window, crop: (u32, u32, u32, u32), smooth: bool, crt: bool) {
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
             return;
@@ -532,9 +632,6 @@ impl GpuPresenter {
             self.surface.configure(&self.device, &self.config);
         }
         let Some(hw) = self.hw.as_mut() else { return };
-        if replay_frame {
-            hw.replay(&self.device, &self.queue, ops, vram, texture_filter);
-        }
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -566,9 +663,16 @@ impl GpuPresenter {
             ((ww - vw) * 0.5, (wh - vh) * 0.5, vw, vh),
             crop,
             smooth,
+            crt,
         );
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
+    }
+
+    fn replay_hw(&mut self, ops: &[HwOp], vram: &[u16], texture_filter: bool) {
+        if let Some(hw) = self.hw.as_mut() {
+            hw.replay(&self.device, &self.queue, ops, vram, texture_filter);
+        }
     }
 
     fn resize_source(&mut self, width: u32, height: u32) {
@@ -619,6 +723,10 @@ impl GpuPresenter {
                         binding: 1,
                         resource: wgpu::BindingResource::Sampler(sampler),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.crt_uniform.as_entire_binding(),
+                    },
                 ],
             })
         };
@@ -633,6 +741,8 @@ impl GpuPresenter {
         width: usize,
         height: usize,
         smooth: bool,
+        crt: bool,
+        crt_scale: f32,
     ) {
         if width == 0 || height == 0 {
             return;
@@ -662,6 +772,11 @@ impl GpuPresenter {
                 height: height as u32,
                 depth_or_array_layers: 1,
             },
+        );
+        self.queue.write_buffer(
+            &self.crt_uniform,
+            0,
+            bytemuck::cast_slice(&[crt as u8 as f32, crt_scale, 0.0f32, 0.0f32]),
         );
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
@@ -994,7 +1109,7 @@ fn filtered_texel(
 "#;
 
 const SCANOUT_SHADER: &str = r#"
-struct SU { ox: f32, oy: f32, cw: f32, ch: f32, output_srgb: f32, pad0: f32, pad1: f32, pad2: f32 }
+struct SU { ox: f32, oy: f32, cw: f32, ch: f32, output_srgb: f32, scale: f32, crt: f32, pad0: f32 }
 @group(0) @binding(0) var<uniform> su: SU;
 @group(0) @binding(1) var img: texture_2d<f32>;
 @group(0) @binding(2) var smp: sampler;
@@ -1011,12 +1126,27 @@ struct Out { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     let dims = vec2<f32>(textureDimensions(img));
     let tuv = (vec2<f32>(su.ox, su.oy) + in.uv * vec2<f32>(su.cw, su.ch)) / dims;
     let sample = textureSample(img, smp, tuv);
-    if su.output_srgb > 0.5 {
-        let lo = sample.rgb / 12.92;
-        let hi = pow((sample.rgb + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
-        return vec4<f32>(select(hi, lo, sample.rgb <= vec3<f32>(0.04045)), sample.a);
+    var color = sample.rgb;
+    if su.crt > 0.5 {
+        let source = vec2<f32>(su.ox, su.oy) + in.uv * vec2<f32>(su.cw, su.ch);
+        let native_x = source.x / su.scale;
+        let native_y = source.y / su.scale;
+        let line_phase = fract(native_y);
+        let line = 0.90 + 0.10 * (1.0 - abs(2.0 * line_phase - 1.0));
+        let phase = u32(floor(native_x * 3.0)) % 3u;
+        let mask = vec3<f32>(
+            select(0.965, 1.0, phase == 0u),
+            select(0.965, 1.0, phase == 1u),
+            select(0.965, 1.0, phase == 2u),
+        );
+        color *= mask * line;
     }
-    return sample;
+    if su.output_srgb > 0.5 {
+        let lo = color / 12.92;
+        let hi = pow((color + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+        return vec4<f32>(select(hi, lo, color <= vec3<f32>(0.04045)), sample.a);
+    }
+    return vec4<f32>(color, sample.a);
 }
 "#;
 
@@ -1703,6 +1833,7 @@ impl HwRenderer {
         viewport: (f32, f32, f32, f32),
         crop: (u32, u32, u32, u32),
         smooth: bool,
+        crt: bool,
     ) {
         let (x0, y0, x1, y1) = crop;
         let sc = self.scale;
@@ -1715,8 +1846,8 @@ impl HwRenderer {
                 ((x1 - x0) * sc) as f32,
                 ((y1 - y0) * sc) as f32,
                 self.output_srgb as u8 as f32,
-                0.0,
-                0.0,
+                sc as f32,
+                crt as u8 as f32,
                 0.0,
             ]),
         );
@@ -1752,6 +1883,7 @@ struct App {
     emulator: Option<Emulator>,
     queue: AudioQueue,
     _audio: Option<cpal::Stream>,
+    audio_enabled: bool,
     gilrs: Option<Gilrs>,
     keys: HashSet<KeyCode>,
     window: Option<Arc<Window>>,
@@ -1761,21 +1893,76 @@ struct App {
     hw_scale: u32,
     smooth: bool,
     texture_filter: bool,
+    crt_filter: bool,
     turbo: bool,
     next_frame: Instant,
     redraw_pending: bool,
-    emulation_due: bool,
     present_due: bool,
     resize_deadline: Option<Instant>,
     last_resize_present: Instant,
     display_size: (usize, usize),
     frame_start: Instant,
     frame_count: u32,
+    present_count: u32,
     emulation_time: Duration,
     output_time: Duration,
     output_size: PhysicalSize<u32>,
     title: String,
     card_path: String,
+}
+
+impl App {
+    fn emulate_one_frame(&mut self) -> f64 {
+        if let Some(g) = self.gilrs.as_mut() {
+            while g.next_event().is_some() {}
+        }
+        let pad = PadInput(!pad_state(&self.keys, self.gilrs.as_ref()));
+        let started = Instant::now();
+        let (refresh_rate, replay_host_frame, frame_ops) = {
+            let Some(emu) = self.emulator.as_mut() else {
+                return 60.0;
+            };
+            emu.set_pad(pad);
+            emu.run_frame();
+            let samples = emu.take_audio();
+            if self.audio_enabled && !self.turbo {
+                for s in samples.chunks_exact(2) {
+                    self.queue.push((s[0], s[1]));
+                }
+            }
+            let hw_render = emu.hw_render();
+            let replay_host_frame = hw_render && !emu.gpu_display_is_24bpp();
+            let frame_ops = if replay_host_frame {
+                emu.take_gpu_hw_ops()
+            } else {
+                if hw_render {
+                    let _ = emu.take_gpu_hw_ops();
+                }
+                Vec::new()
+            };
+            if hw_render && !emu.gpu_display_is_24bpp() {
+                let crop = emu.gpu_display_crop();
+                self.display_size = ((crop.2 - crop.0) as usize, (crop.3 - crop.1) as usize);
+            } else {
+                self.display_size = emu.framebuffer(&mut self.framebuffer);
+            }
+            (emu.refresh_rate(), replay_host_frame, frame_ops)
+        };
+        self.emulation_time += started.elapsed();
+        self.frame_count += 1;
+
+        if replay_host_frame {
+            self.hw_ops.extend(frame_ops);
+            if let (Some(presenter), Some(emu)) = (self.presenter.as_mut(), self.emulator.as_ref())
+            {
+                let replay_started = Instant::now();
+                presenter.replay_hw(&self.hw_ops, &emu.bus.gpu.vram, self.texture_filter);
+                self.output_time += replay_started.elapsed();
+            }
+            self.hw_ops.clear();
+        }
+        refresh_rate
+    }
 }
 
 impl ApplicationHandler for App {
@@ -1819,6 +2006,22 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(_) => {
                 // Let the drag settle before reconfiguring the swapchain.
                 self.resize_deadline = Some(Instant::now() + Duration::from_millis(80));
+                // Windows runs a modal size/move loop that starves
+                // about_to_wait, but resize events still arrive: pump one
+                // due emulation frame here so audio never stalls mid-drag.
+                let now = Instant::now();
+                if now >= self.next_frame {
+                    let refresh_rate = self.emulate_one_frame();
+                    self.next_frame = if self.turbo {
+                        Instant::now()
+                    } else {
+                        advance_frame_deadline(
+                            self.next_frame,
+                            Duration::from_secs_f64(1.0 / refresh_rate),
+                            Instant::now(),
+                        )
+                    };
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -1853,6 +2056,12 @@ impl ApplicationHandler for App {
                             }
                         );
                     }
+                    if code == KeyCode::KeyC
+                        && event.state == ElementState::Pressed
+                        && !event.repeat
+                    {
+                        self.crt_filter = !self.crt_filter;
+                    }
                     if code == KeyCode::KeyD
                         && event.state == ElementState::Pressed
                         && !event.repeat
@@ -1871,43 +2080,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.redraw_pending = false;
-                let emulation_due = std::mem::take(&mut self.emulation_due);
                 let present_due = std::mem::take(&mut self.present_due);
-                let frame_started = Instant::now();
-                let mut refresh_rate = None;
-                if emulation_due {
-                    let Some(emu) = self.emulator.as_mut() else {
-                        return;
-                    };
-                    if let Some(g) = self.gilrs.as_mut() {
-                        while g.next_event().is_some() {}
-                    }
-                    emu.set_pad(PadInput(!pad_state(&self.keys, self.gilrs.as_ref())));
-                    let emulation_started = Instant::now();
-                    emu.run_frame();
-                    self.emulation_time += emulation_started.elapsed();
-                    self.frame_count += 1;
-                    let samples = emu.take_audio();
-                    if !self.turbo {
-                        for s in samples.chunks_exact(2) {
-                            self.queue.push((s[0], s[1]));
-                        }
-                    }
-                    if emu.hw_render() {
-                        self.hw_ops = emu.take_gpu_hw_ops();
-                        if emu.gpu_display_is_24bpp() {
-                            self.display_size = emu.framebuffer(&mut self.framebuffer);
-                        } else {
-                            self.display_size = {
-                                let c = emu.gpu_display_crop();
-                                ((c.2 - c.0) as usize, (c.3 - c.1) as usize)
-                            };
-                        }
-                    } else {
-                        self.display_size = emu.framebuffer(&mut self.framebuffer);
-                    }
-                    refresh_rate = Some(emu.refresh_rate());
-                }
                 if present_due && self.display_size.0 != 0 {
                     let output_started = Instant::now();
                     if let Some(presenter) = self.presenter.as_mut() {
@@ -1916,67 +2089,74 @@ impl ApplicationHandler for App {
                         {
                             presenter.render_hw(
                                 window,
-                                &self.hw_ops,
-                                &emu.bus.gpu.vram,
                                 emu.gpu_display_crop(),
                                 self.smooth,
-                                emulation_due,
-                                self.texture_filter,
+                                self.crt_filter,
                             );
                         } else {
+                            let crt_scale = if emu.gpu_display_is_24bpp() {
+                                1.0
+                            } else {
+                                emu.bus.gpu.internal_scale() as f32
+                            };
                             presenter.render(
                                 window,
                                 &self.framebuffer,
                                 self.display_size.0,
                                 self.display_size.1,
                                 self.smooth,
+                                self.crt_filter,
+                                crt_scale,
                             );
                         }
                     }
-                    if emulation_due {
-                        self.output_time += output_started.elapsed();
-                    }
+                    self.output_time += output_started.elapsed();
+                    self.present_count += 1;
                 }
-                if emulation_due && self.frame_start.elapsed() >= Duration::from_secs(1) {
-                    let fps = self.frame_count as f64 / self.frame_start.elapsed().as_secs_f64();
+                if self.frame_start.elapsed() >= Duration::from_secs(1) {
+                    let elapsed = self.frame_start.elapsed().as_secs_f64();
+                    let emu_fps = self.frame_count as f64 / elapsed;
+                    let present_fps = self.present_count as f64 / elapsed;
                     let denominator = self.frame_count.max(1) as f64;
                     let emu_ms = self.emulation_time.as_secs_f64() * 1000.0 / denominator;
                     let output_ms = self.output_time.as_secs_f64() * 1000.0 / denominator;
                     let audio_underruns = self.queue.underruns.swap(0, Ordering::Relaxed);
                     let audio_overruns = self.queue.overruns.swap(0, Ordering::Relaxed);
+                    let target_hz = self
+                        .emulator
+                        .as_ref()
+                        .map(Emulator::refresh_rate)
+                        .unwrap_or(60.0);
                     let tex_filter = if self.texture_filter {
                         "bilinear tex"
                     } else {
                         "nearest tex"
                     };
+                    let crt_filter = if self.crt_filter { "CRT" } else { "no CRT" };
                     let gpu = self
                         .presenter
                         .as_ref()
                         .map(|p| p.adapter_name.as_str())
                         .unwrap_or("GPU");
                     window.set_title(&format!(
-                        "{} — {:.0} fps • emu {:.1} ms + output {:.1} ms • audio U{} O{} • {} • {}",
+                        "{} — emu {:.0} / present {:.0} fps • {:.1} Hz target • emu {:.1} ms + output {:.1} ms • audio U{} O{} • {} • {} • {}",
                         self.title,
-                        fps,
+                        emu_fps,
+                        present_fps,
+                        target_hz,
                         emu_ms,
                         output_ms,
                         audio_underruns,
                         audio_overruns,
                         tex_filter,
+                        crt_filter,
                         gpu
                     ));
                     self.frame_count = 0;
+                    self.present_count = 0;
                     self.frame_start = Instant::now();
                     self.emulation_time = Duration::ZERO;
                     self.output_time = Duration::ZERO;
-                }
-                if let Some(rate) = refresh_rate {
-                    let period = Duration::from_secs_f64(1.0 / rate);
-                    self.next_frame = if self.turbo {
-                        Instant::now()
-                    } else {
-                        (frame_started + period).max(Instant::now())
-                    };
                 }
             }
             _ => {}
@@ -1985,18 +2165,35 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
+        let frame_due = now >= self.next_frame;
+        if frame_due {
+            let refresh_rate = self.emulate_one_frame();
+            let period = Duration::from_secs_f64(1.0 / refresh_rate);
+            self.next_frame = if self.turbo {
+                Instant::now()
+            } else {
+                // Fixed-grid pacing: overdue frames run back-to-back so a
+                // slow frame is repaid from emulator headroom instead of
+                // permanently draining the audio buffer.
+                advance_frame_deadline(self.next_frame, period, Instant::now())
+            };
+        }
+
+        let now = Instant::now();
         let resize_due = self.resize_deadline.is_some_and(|deadline| now >= deadline);
         let resize_refresh_due = self.resize_deadline.is_some()
             && now.duration_since(self.last_resize_present) >= Duration::from_millis(33);
-        let frame_due = now >= self.next_frame;
-        if !self.redraw_pending && (resize_due || resize_refresh_due || frame_due) {
+        let present_requested = if self.resize_deadline.is_some() {
+            resize_due || resize_refresh_due
+        } else {
+            frame_due
+        };
+        if !self.redraw_pending && present_requested {
             if let Some(window) = &self.window {
                 window.request_redraw();
                 self.redraw_pending = true;
-                self.emulation_due = frame_due;
-                self.present_due =
-                    self.resize_deadline.is_none() || resize_due || resize_refresh_due;
-                if self.present_due && self.resize_deadline.is_some() {
+                self.present_due = true;
+                if self.resize_deadline.is_some() {
                     self.last_resize_present = now;
                 }
                 if resize_due {
@@ -2004,19 +2201,26 @@ impl ApplicationHandler for App {
                 }
             }
         }
-        event_loop.set_control_flow(if self.redraw_pending {
-            ControlFlow::Wait
-        } else {
-            let resize_present = self
-                .resize_deadline
-                .map(|_| self.last_resize_present + Duration::from_millis(33));
-            let resize_end = self.resize_deadline.unwrap_or(self.next_frame);
-            ControlFlow::WaitUntil(
-                resize_present.map_or(self.next_frame.min(resize_end), |present| {
-                    self.next_frame.min(resize_end).min(present)
-                }),
-            )
+        let resize_present = self
+            .resize_deadline
+            .map(|_| self.last_resize_present + Duration::from_millis(33));
+        let resize_end = self.resize_deadline.unwrap_or(self.next_frame);
+        let deadline = resize_present.map_or(self.next_frame.min(resize_end), |present| {
+            self.next_frame.min(resize_end).min(present)
         });
+        // Windows' coarse wait timer can wake after the 60 Hz deadline.
+        // Keep the frame timer live even when a redraw is pending, and poll
+        // briefly before the deadline so emulation is not gated by WM_PAINT.
+        let guard = if cfg!(target_os = "windows") {
+            Duration::from_millis(1)
+        } else {
+            Duration::ZERO
+        };
+        if frame_deadline_needs_poll(now, deadline, guard) {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        } else {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline - guard));
+        }
     }
 }
 
@@ -2025,8 +2229,10 @@ fn main() {
     let fast = args.iter().any(|a| a == "--fast");
     let dynarec = args.iter().any(|a| a == "--dynarec");
     let sw_render = args.iter().any(|a| a == "--sw");
+    let mute = args.iter().any(|a| a == "--mute");
     let mut internal_scale = 1;
     let mut texture_filter = None;
+    let mut crt_filter = None;
     let mut window_size = PhysicalSize::new(960, 720);
     for arg in &args {
         if let Some(value) = arg.strip_prefix("--res=") {
@@ -2047,13 +2253,21 @@ fn main() {
                 std::process::exit(2);
             }));
         }
+        if let Some(value) = arg.strip_prefix("--crt=") {
+            crt_filter = Some(parse_crt_filter(value).unwrap_or_else(|error| {
+                eprintln!("invalid --crt value {value:?}: {error}");
+                std::process::exit(2);
+            }));
+        }
     }
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let Some(cue) = pos.first() else {
         eprintln!(
-            "usage: play_gpu <game.cue> [bios.bin] [--fast] [--dynarec] [--res=2x|4x|6x|8x|WIDTHxHEIGHT] [--texture-filter=nearest|bilinear]"
+            "usage: play_gpu <game.cue> [bios.bin] [--fast] [--dynarec] [--mute] [--res=2x|4x|6x|8x|WIDTHxHEIGHT] [--texture-filter=nearest|bilinear] [--crt=on|off]"
         );
-        eprintln!("Use --window-size=WIDTHxHEIGHT to resize only the window.");
+        eprintln!(
+            "Use --window-size=WIDTHxHEIGHT to resize only the window; press C to toggle CRT."
+        );
         std::process::exit(1);
     };
     let bios_path = pos.get(1).map(|s| s.as_str()).unwrap_or(DEFAULT_BIOS);
@@ -2073,8 +2287,15 @@ fn main() {
         emulator.bus.sio.set_card_image(0, &image);
     }
     let queue = Arc::new(AudioRing::new());
-    let audio = start_audio(queue.clone());
-    if audio.is_none() {
+    let audio = if mute {
+        None
+    } else {
+        start_audio(queue.clone())
+    };
+    let audio_enabled = audio.is_some();
+    if mute {
+        eprintln!("Audio muted");
+    } else if audio.is_none() {
         eprintln!("No audio output device; running silently");
     }
     let stem = std::path::Path::new(cue.as_str())
@@ -2085,6 +2306,7 @@ fn main() {
         emulator: Some(emulator),
         queue,
         _audio: audio,
+        audio_enabled,
         gilrs: Gilrs::new().ok(),
         keys: HashSet::new(),
         window: None,
@@ -2093,23 +2315,25 @@ fn main() {
         hw_ops: Vec::new(),
         hw_scale: internal_scale as u32,
         smooth: true,
-        texture_filter: texture_filter.unwrap_or(internal_scale >= 4),
+        texture_filter: texture_filter.unwrap_or(false),
+        crt_filter: crt_filter.unwrap_or(true),
         turbo: false,
-        next_frame: Instant::now(),
+        next_frame: seeded_frame_deadline(Instant::now()),
         redraw_pending: false,
-        emulation_due: false,
         present_due: false,
         resize_deadline: None,
         last_resize_present: Instant::now(),
         display_size: (0, 0),
         frame_start: Instant::now(),
         frame_count: 0,
+        present_count: 0,
         emulation_time: Duration::ZERO,
         output_time: Duration::ZERO,
         output_size: window_size,
         title: format!("AES Oxide — {stem} — {internal_scale}x internal"),
         card_path,
     };
+    let _frame_timer = FrameTimerResolution::request();
     let event_loop = EventLoop::new().expect("create event loop");
     event_loop.run_app(&mut app).expect("run window event loop");
 }
@@ -2117,7 +2341,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUDIO_RING_CAP, AudioRing, Ordering, parse_internal_scale, parse_texture_filter,
+        AUDIO_RING_CAP, AudioRing, Duration, Instant, Ordering, advance_frame_deadline,
+        frame_deadline_needs_poll, parse_crt_filter, parse_internal_scale, parse_texture_filter,
         parse_window_size,
     };
 
@@ -2148,16 +2373,67 @@ mod tests {
         assert!(!parse_texture_filter("nearest").unwrap());
         assert!(parse_texture_filter("bilinear").unwrap());
         assert!(parse_texture_filter("fsr").is_err());
+        assert!(parse_crt_filter("on").unwrap());
+        assert!(!parse_crt_filter("off").unwrap());
+        assert!(parse_crt_filter("crt").is_err());
+    }
+
+    #[test]
+    fn frame_pacer_spins_only_inside_windows_timer_guard() {
+        let now = Instant::now();
+        let guard = Duration::from_millis(2);
+        assert!(!frame_deadline_needs_poll(
+            now,
+            now + Duration::from_millis(8),
+            guard
+        ));
+        assert!(frame_deadline_needs_poll(
+            now,
+            now + Duration::from_millis(1),
+            guard
+        ));
+    }
+
+    #[test]
+    fn frame_grid_repays_late_frames_instead_of_slipping() {
+        let period = Duration::from_micros(16_680);
+        let slot = Instant::now();
+        // A 135 ms boot burst ends 8+ frames behind the grid: the next
+        // deadline must stay in the past so catch-up frames run now.
+        let now = slot + Duration::from_millis(135);
+        let next = advance_frame_deadline(slot, period, now);
+        assert!(next <= now);
+        // Successive catch-up frames keep stepping the same grid until
+        // it realigns with the wall clock.
+        let mut cursor = next;
+        for _ in 0..9 {
+            cursor = advance_frame_deadline(cursor, period, now);
+        }
+        assert!(cursor > now);
+    }
+
+    #[test]
+    fn frame_grid_resyncs_after_a_long_stall() {
+        let period = Duration::from_micros(16_680);
+        let slot = Instant::now();
+        // A multi-second stall (modal window drag) must not produce a
+        // huge catch-up burst: resync to a bounded seeded debt.
+        let now = slot + Duration::from_secs(5);
+        let next = advance_frame_deadline(slot, period, now);
+        assert!(next <= now);
+        assert!(now - next <= Duration::from_millis(210));
     }
 
     #[test]
     fn audio_ring_preserves_order_and_drops_on_full_without_blocking() {
         let q = AudioRing::new();
-        for n in 0..AUDIO_RING_CAP as i16 {
-            q.push((n, -n));
+        for n in 0..AUDIO_RING_CAP {
+            let v = n as i16;
+            q.push((v, v.wrapping_neg()));
         }
-        for n in 0..(AUDIO_RING_CAP as i16 - 1) {
-            assert_eq!(q.pop(), Some((n, -n)));
+        for n in 0..(AUDIO_RING_CAP - 1) {
+            let v = n as i16;
+            assert_eq!(q.pop(), Some((v, v.wrapping_neg())));
         }
         assert_eq!(q.pop(), None);
         assert_eq!(q.overruns.load(Ordering::Relaxed), 1);
