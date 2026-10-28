@@ -9,7 +9,7 @@ use aruanpsx::{
     gpu::{HwOp, HwPrim, hw_flags as HF},
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use gilrs::{Axis, Button, Gilrs};
+use gilrs::{Axis, Button, EventType, Gilrs};
 use std::cell::UnsafeCell;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -176,7 +176,13 @@ fn start_audio(queue: AudioQueue) -> Option<cpal::Stream> {
     Some(stream)
 }
 
-fn pad_state(keys: &HashSet<KeyCode>, gilrs: Option<&Gilrs>) -> u16 {
+fn pad_state(
+    keys: &HashSet<KeyCode>,
+    gilrs: Option<&Gilrs>,
+    raw_buttons: &HashSet<(usize, u32)>,
+    start_code: Option<u32>,
+    select_code: Option<u32>,
+) -> u16 {
     let key_map = [
         (KeyCode::ArrowUp, b::UP),
         (KeyCode::ArrowDown, b::DOWN),
@@ -198,7 +204,14 @@ fn pad_state(keys: &HashSet<KeyCode>, gilrs: Option<&Gilrs>) -> u16 {
         .filter(|(key, _)| keys.contains(key))
         .fold(0, |acc, (_, mask)| acc | mask);
     if let Some(g) = gilrs {
-        for (_, pad) in g.gamepads() {
+        for (id, pad) in g.gamepads() {
+            let id = usize::from(id);
+            if start_code.is_some_and(|c| raw_buttons.contains(&(id, c))) {
+                bits |= b::START;
+            }
+            if select_code.is_some_and(|c| raw_buttons.contains(&(id, c))) {
+                bits |= b::SELECT;
+            }
             let map = [
                 (Button::DPadUp, b::UP),
                 (Button::DPadDown, b::DOWN),
@@ -338,6 +351,116 @@ fn seeded_frame_deadline(now: Instant) -> Instant {
 unsafe extern "system" {
     fn timeBeginPeriod(period: u32) -> u32;
     fn timeEndPeriod(period: u32) -> u32;
+    fn joyGetPosEx(id: u32, info: *mut JoyInfoEx) -> u32;
+    fn joyGetNumDevs() -> u32;
+}
+
+/// Classic winmm joystick reading: sees buttons the WGI backend drops
+/// (generic HID pads often report Select/Start on usages gilrs misses).
+#[repr(C)]
+#[derive(Default)]
+struct JoyInfoEx {
+    dw_size: u32,
+    dw_flags: u32,
+    dw_xpos: u32,
+    dw_ypos: u32,
+    dw_zpos: u32,
+    dw_rpos: u32,
+    dw_upos: u32,
+    dw_vpos: u32,
+    dw_buttons: u32,
+    dw_button_number: u32,
+    dw_pov: u32,
+    dw_reserved1: u32,
+    dw_reserved2: u32,
+}
+
+#[cfg(target_os = "windows")]
+const JOY_RETURNALL: u32 = 0xFF;
+#[cfg(target_os = "windows")]
+const JOYERR_NOERROR: u32 = 0;
+const JOY_POVCENTERED: u32 = 0xFFFF;
+
+/// Joystick IDs present at startup (probed with a position read).
+fn scan_winmm_pads() -> Vec<u32> {
+    #[cfg(target_os = "windows")]
+    {
+        let max = unsafe { joyGetNumDevs() }.max(16);
+        (0..max)
+            .filter(|&id| read_winmm_pad(id).is_some())
+            .collect()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Vec::new()
+    }
+}
+
+fn read_winmm_pad(id: u32) -> Option<JoyInfoEx> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut info = JoyInfoEx {
+            dw_size: std::mem::size_of::<JoyInfoEx>() as u32,
+            dw_flags: JOY_RETURNALL,
+            ..Default::default()
+        };
+        (unsafe { joyGetPosEx(id, &mut info) } == JOYERR_NOERROR).then_some(info)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = id;
+        None
+    }
+}
+
+/// Standard DirectInput numbering for PS-style pads (and Switch-Pro
+/// clones like the GameSir ones): 8 = Select, 9 = Start, POV hat =
+/// d-pad — safe to OR in for every pad since those indices are
+/// unambiguous. `full` additionally maps the whole pad using the
+/// dominant non-XInput layout (face buttons in PS position order);
+/// used only when gilrs sees no pad at all, where an imperfect guess
+/// beats a dead controller.
+fn winmm_info_bits(info: &JoyInfoEx, full: bool) -> u16 {
+    let mut bits = 0;
+    let btn = info.dw_buttons;
+    if btn & (1 << 9) != 0 {
+        bits |= b::START;
+    }
+    if btn & (1 << 8) != 0 {
+        bits |= b::SELECT;
+    }
+    if full {
+        for (idx, mask) in [
+            (0, b::SQUARE),
+            (1, b::CROSS),
+            (2, b::CIRCLE),
+            (3, b::TRIANGLE),
+            (4, b::L1),
+            (5, b::R1),
+            (6, b::L2),
+            (7, b::R2),
+        ] {
+            if btn & (1 << idx) != 0 {
+                bits |= mask;
+            }
+        }
+    }
+    let pov = info.dw_pov;
+    if pov != JOY_POVCENTERED {
+        if pov <= 4500 || pov >= 31500 {
+            bits |= b::UP;
+        }
+        if (13500..=22500).contains(&pov) {
+            bits |= b::DOWN;
+        }
+        if (4500..=13500).contains(&pov) {
+            bits |= b::RIGHT;
+        }
+        if (22500..=31500).contains(&pov) {
+            bits |= b::LEFT;
+        }
+    }
+    bits
 }
 
 struct FrameTimerResolution {
@@ -1885,6 +2008,12 @@ struct App {
     _audio: Option<cpal::Stream>,
     audio_enabled: bool,
     gilrs: Option<Gilrs>,
+    /// Raw gilrs event codes currently held down, for pads whose
+    /// Start/Select arrive unmapped (Button::Unknown or wrong names).
+    pressed_pad_buttons: HashSet<(usize, u32)>,
+    pad_start_code: Option<u32>,
+    pad_select_code: Option<u32>,
+    winmm_pads: Vec<u32>,
     keys: HashSet<KeyCode>,
     window: Option<Arc<Window>>,
     presenter: Option<GpuPresenter>,
@@ -1914,9 +2043,54 @@ struct App {
 impl App {
     fn emulate_one_frame(&mut self) -> f64 {
         if let Some(g) = self.gilrs.as_mut() {
-            while g.next_event().is_some() {}
+            while let Some(ev) = g.next_event() {
+                match ev.event {
+                    EventType::ButtonPressed(_, code)
+                    | EventType::ButtonChanged(_, _, code)
+                    | EventType::ButtonRepeated(_, code) => {
+                        self.pressed_pad_buttons
+                            .insert((usize::from(ev.id), code.into_u32()));
+                    }
+                    EventType::ButtonReleased(_, code) => {
+                        self.pressed_pad_buttons
+                            .remove(&(usize::from(ev.id), code.into_u32()));
+                    }
+                    EventType::Connected => {
+                        let pad = g.gamepad(ev.id);
+                        eprintln!(
+                            "gamepad {} connected: {} mapping={:?}",
+                            usize::from(ev.id),
+                            pad.name(),
+                            pad.mapping_source(),
+                        );
+                    }
+                    EventType::Disconnected => {
+                        eprintln!("gamepad {} disconnected", usize::from(ev.id));
+                    }
+                    _ => {}
+                }
+            }
         }
-        let pad = PadInput(!pad_state(&self.keys, self.gilrs.as_ref()));
+        let mut pad_bits = pad_state(
+            &self.keys,
+            self.gilrs.as_ref(),
+            &self.pressed_pad_buttons,
+            self.pad_start_code,
+            self.pad_select_code,
+        );
+        // winmm sees pads gilrs can't (non-WGI HID devices). Always take
+        // Select/Start/d-pad from it; take the full conventional mapping
+        // only when gilrs found no gamepads at all.
+        let gilrs_padless = self
+            .gilrs
+            .as_ref()
+            .is_none_or(|g| g.gamepads().next().is_none());
+        for &id in &self.winmm_pads {
+            if let Some(info) = read_winmm_pad(id) {
+                pad_bits |= winmm_info_bits(&info, gilrs_padless);
+            }
+        }
+        let pad = PadInput(!pad_bits);
         let started = Instant::now();
         let (refresh_rate, replay_host_frame, frame_ops) = {
             let Some(emu) = self.emulator.as_mut() else {
@@ -2233,6 +2407,8 @@ fn main() {
     let mut internal_scale = 1;
     let mut texture_filter = None;
     let mut crt_filter = None;
+    let mut pad_start_code = None;
+    let mut pad_select_code = None;
     let mut window_size = PhysicalSize::new(960, 720);
     for arg in &args {
         if let Some(value) = arg.strip_prefix("--res=") {
@@ -2256,6 +2432,18 @@ fn main() {
         if let Some(value) = arg.strip_prefix("--crt=") {
             crt_filter = Some(parse_crt_filter(value).unwrap_or_else(|error| {
                 eprintln!("invalid --crt value {value:?}: {error}");
+                std::process::exit(2);
+            }));
+        }
+        if let Some(value) = arg.strip_prefix("--pad-start-code=") {
+            pad_start_code = Some(value.parse::<u32>().unwrap_or_else(|_| {
+                eprintln!("invalid --pad-start-code value {value:?}: expected a raw code number");
+                std::process::exit(2);
+            }));
+        }
+        if let Some(value) = arg.strip_prefix("--pad-select-code=") {
+            pad_select_code = Some(value.parse::<u32>().unwrap_or_else(|_| {
+                eprintln!("invalid --pad-select-code value {value:?}: expected a raw code number");
                 std::process::exit(2);
             }));
         }
@@ -2307,7 +2495,19 @@ fn main() {
         queue,
         _audio: audio,
         audio_enabled,
-        gilrs: Gilrs::new().ok(),
+        gilrs: Gilrs::new()
+            .map_err(|e| eprintln!("gamepad init failed: {e}"))
+            .ok(),
+        pressed_pad_buttons: HashSet::new(),
+        pad_start_code,
+        pad_select_code,
+        winmm_pads: {
+            let ids = scan_winmm_pads();
+            if !ids.is_empty() {
+                eprintln!("winmm joystick fallback: {} pad(s) {ids:?}", ids.len());
+            }
+            ids
+        },
         keys: HashSet::new(),
         window: None,
         presenter: None,
