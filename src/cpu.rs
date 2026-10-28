@@ -16,6 +16,7 @@
 //! refinement is handled by the scheduler layer.
 
 use crate::bus::Bus;
+use crate::dynarec::Dynarec;
 use crate::gte::Gte;
 
 // ---- exception codes (Cop0 CAUSE.ExcCode) ----
@@ -39,9 +40,18 @@ const COP0_CAUSE: u8 = 13;
 const COP0_EPC: u8 = 14;
 const COP0_BADVADDR: u8 = 8;
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LoadDelay {
+    pub(crate) reg: u8,
+    _padding: [u8; 3],
+    pub(crate) value: u32,
+}
+
+#[repr(C)]
 pub struct Cpu {
     /// r[0] is always zero.
-    r: [u32; 32],
+    pub(crate) r: [u32; 32],
     hi: u32,
     lo: u32,
     /// Address of the next instruction to fetch.
@@ -59,7 +69,7 @@ pub struct Cpu {
     branch_owner: u32,
     /// Load issued by the PREVIOUS instruction — commits after the
     /// current instruction executes.
-    load_delay: (u8, u32),
+    pub(crate) load_delay: LoadDelay,
     /// Load issued by the CURRENT instruction.
     load_new: (u8, u32),
     /// Cop0 registers (12=SR, 13=CAUSE, 14=EPC, plus breakpoints).
@@ -83,7 +93,7 @@ impl Cpu {
             in_delay_slot: false,
             took_branch_slot: false,
             branch_owner: 0,
-            load_delay: (0, 0),
+            load_delay: LoadDelay::default(),
             load_new: (0, 0),
             cop0: [0; 16],
             gte: Gte::new(),
@@ -129,7 +139,7 @@ impl Cpu {
         self.next_pc = next_pc;
         self.cop0 = cop0;
         self.load_new = (0, 0);
-        self.load_delay = (0, 0);
+        self.load_delay = LoadDelay::default();
         self.in_delay_slot = false;
         self.took_branch_slot = false;
     }
@@ -147,7 +157,7 @@ impl Cpu {
     pub fn set_pc(&mut self, pc: u32) {
         self.pc = pc;
         self.next_pc = pc.wrapping_add(4);
-        self.load_delay = (0, 0);
+        self.load_delay = LoadDelay::default();
         self.load_new = (0, 0);
         self.in_delay_slot = false;
         self.took_branch_slot = false;
@@ -158,8 +168,8 @@ impl Cpu {
         if i != 0 {
             // an instruction in a load's delay slot that writes the
             // load's target register wins: the pending load is dropped
-            if self.load_delay.0 == i {
-                self.load_delay = (0, 0);
+            if self.load_delay.reg == i {
+                self.load_delay = LoadDelay::default();
             }
             self.r[i as usize] = v;
         }
@@ -167,6 +177,14 @@ impl Cpu {
 
     /// One instruction. Returns elapsed sysclk cycles.
     pub fn step(&mut self, bus: &mut Bus) -> u32 {
+        self.step_inner(bus, None)
+    }
+
+    pub fn step_with_dynarec(&mut self, bus: &mut Bus, dynarec: &mut Dynarec) -> u32 {
+        self.step_inner(bus, Some(dynarec))
+    }
+
+    fn step_inner(&mut self, bus: &mut Bus, mut dynarec: Option<&mut Dynarec>) -> u32 {
         // hardware interrupt line → CAUSE.IP2 (bit 10)
         if bus.irq.pending() {
             self.cop0[COP0_CAUSE as usize] |= 1 << 10;
@@ -209,14 +227,25 @@ impl Cpu {
         self.pc = self.next_pc;
         self.next_pc = self.pc.wrapping_add(4);
 
-        extra += self.exec(op, bus);
+        let translated = if let Some(jit) = dynarec.as_deref_mut() {
+            jit.execute(op, self)
+        } else {
+            false
+        };
+        if !translated {
+            extra += self.exec(op, bus);
+        }
         // Commit the pending load from the previous instruction. A new
         // load to the same register cancels the older write-back.
-        let (lr, lv) = self.load_delay;
+        let (lr, lv) = (self.load_delay.reg, self.load_delay.value);
         if lr != 0 && lr != self.load_new.0 {
             self.r[lr as usize] = lv;
         }
-        self.load_delay = self.load_new;
+        self.load_delay = LoadDelay {
+            reg: self.load_new.0,
+            value: self.load_new.1,
+            ..Default::default()
+        };
         self.load_new = (0, 0);
         1 + extra + bus.stall
     }
@@ -224,11 +253,11 @@ impl Cpu {
     fn exception(&mut self, code: u32) {
         // the instruction that issued the pending load retired before
         // the exception — complete it so the handler sees the value
-        let (lr, lv) = self.load_delay;
+        let (lr, lv) = (self.load_delay.reg, self.load_delay.value);
         if lr != 0 {
             self.r[lr as usize] = lv;
         }
-        self.load_delay = (0, 0);
+        self.load_delay = LoadDelay::default();
         self.load_new = (0, 0);
         // push the KU/IE mode stack
         let sr = self.cop0[COP0_SR as usize];
@@ -511,7 +540,11 @@ impl Cpu {
             0x22 => {                                                 // LWL
                 let a = self.rg(rs).wrapping_add(imm as u32);
                 let aligned = bus.load32(a & !3);
-                let cur = if rt == self.load_delay.0 { self.load_delay.1 } else { self.rg(rt) };
+                let cur = if rt == self.load_delay.reg {
+                    self.load_delay.value
+                } else {
+                    self.rg(rt)
+                };
                 let v = match a & 3 {
                     0 => (cur & 0x00FF_FFFF) | (aligned << 24),
                     1 => (cur & 0x0000_FFFF) | (aligned << 16),
@@ -540,7 +573,11 @@ impl Cpu {
             0x26 => {                                                 // LWR
                 let a = self.rg(rs).wrapping_add(imm as u32);
                 let aligned = bus.load32(a & !3);
-                let cur = if rt == self.load_delay.0 { self.load_delay.1 } else { self.rg(rt) };
+                let cur = if rt == self.load_delay.reg {
+                    self.load_delay.value
+                } else {
+                    self.rg(rt)
+                };
                 let v = match a & 3 {
                     0 => aligned,
                     1 => (cur & 0xFF00_0000) | (aligned >> 8),

@@ -16,6 +16,7 @@ pub mod bus;
 pub mod cdrom;
 pub mod cpu;
 pub mod disc;
+mod dynarec;
 pub mod dma;
 pub mod gpu;
 pub mod gte;
@@ -90,6 +91,7 @@ pub struct Emulator {
     cd_line: bool,
     gpu_irq_line: bool,
     fast_exe: Option<PendingExe>,
+    dynarec: dynarec::Dynarec,
 }
 
 impl Emulator {
@@ -105,7 +107,22 @@ impl Emulator {
             cd_line: false,
             gpu_irq_line: false,
             fast_exe: None,
+            dynarec: dynarec::Dynarec::default(),
         }
+    }
+
+    /// Enable or disable native ALU translations; unsupported operations
+    /// always continue through the reference interpreter.
+    pub fn set_dynarec_enabled(&mut self, enabled: bool) {
+        self.dynarec.set_enabled(enabled);
+    }
+
+    pub fn dynarec_enabled(&self) -> bool {
+        self.dynarec.enabled()
+    }
+
+    pub fn dynarec_compiled_op_count(&self) -> usize {
+        self.dynarec.compiled_op_count()
     }
 
     pub fn insert_disc(&mut self, d: disc::Disc) {
@@ -201,27 +218,53 @@ impl Emulator {
     /// Run until the next vblank.
     pub fn run_frame(&mut self) -> bool {
         self.frame_done = false;
-        while !self.frame_done {
-            self.step();
+        if self.dynarec.enabled() {
+            while !self.frame_done {
+                self.step_inner::<true>();
+            }
+        } else {
+            while !self.frame_done {
+                self.step_inner::<false>();
+            }
         }
         true
     }
 
     /// N-instruction helper for tests.
     pub fn run_cycles(&mut self, n: u64) {
-        for _ in 0..n {
-            self.step();
+        if self.dynarec.enabled() {
+            for _ in 0..n {
+                self.step_inner::<true>();
+            }
+        } else {
+            for _ in 0..n {
+                self.step_inner::<false>();
+            }
         }
     }
 
     /// One CPU instruction plus device time.
     pub fn step(&mut self) {
+        if self.dynarec.enabled() {
+            self.step_inner::<true>();
+        } else {
+            self.step_inner::<false>();
+        }
+    }
+
+    #[inline(always)]
+    fn step_inner<const USE_DYNAREC: bool>(&mut self) {
         self.bus.now = self.cycles;
         if self.fast_exe.is_some() && self.cpu.fetch_pc() == 0x8003_0000 {
             let exe = self.fast_exe.take().unwrap();
             self.start_exe(&exe.data);
         }
-        let n = self.cpu.step(&mut self.bus);
+        let n = if USE_DYNAREC {
+            self.cpu
+                .step_with_dynarec(&mut self.bus, &mut self.dynarec)
+        } else {
+            self.cpu.step(&mut self.bus)
+        };
         if !self.cpu.tty.is_empty() {
             self.bus.tty.push_str(&self.cpu.tty);
             self.cpu.tty.clear();
