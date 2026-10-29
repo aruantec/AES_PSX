@@ -150,7 +150,10 @@ impl Dma {
                 if now >= at {
                     self.finishing[i] = None;
                     self.ch[i].chcr &= !(1 << 24);
-                    if self.dicr & (1 << (16 + i)) != 0 {
+                    // Per hardware: the completion flag sets only when
+                    // BOTH the channel mask (bit 16+i) and the master
+                    // enable (bit 23) are on.
+                    if self.dicr & (1 << (16 + i)) != 0 && self.dicr & (1 << 23) != 0 {
                         self.dicr |= 1 << (24 + i);
                     }
                     self.update_irq();
@@ -172,8 +175,8 @@ impl Dma {
     }
 
     pub fn irq_out(&self) -> bool {
-        let flagged = (self.dicr >> 24) & (self.dicr >> 16) & 0x7F;
-        self.dicr & (1 << 15) != 0 || (self.dicr & (1 << 23) != 0 && flagged != 0)
+        let completed = self.dicr & 0x7F00_0000 != 0;
+        self.dicr & (1 << 15) != 0 || (self.dicr & (1 << 23) != 0 && completed)
     }
 
     /// Words to move for a burst/slice transfer.
@@ -193,5 +196,51 @@ impl Dma {
             }
             Mode::LinkedList => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Dma;
+
+    #[test]
+    fn completion_flag_remains_in_master_irq_after_channel_mask_is_disabled() {
+        let mut dma = Dma::new();
+        let master = 1 << 23;
+        let ch2_mask = 1 << 18;
+        let ch2_flag = 1 << 26;
+
+        dma.write32(0x74, master | ch2_mask);
+        dma.ch[2].chcr = 1 << 24;
+        dma.finishing[2] = Some(10);
+        dma.tick(10);
+
+        assert_ne!(dma.dicr & ch2_flag, 0);
+        assert!(dma.irq_out());
+        assert!(dma.irq_edge);
+        dma.irq_edge = false;
+
+        // Channel masks gate creation of completion flags, not whether an
+        // already-latched flag contributes to DICR's master interrupt bit.
+        dma.write32(0x74, master);
+        assert!(dma.irq_out());
+        assert!(!dma.irq_edge);
+
+        dma.write32(0x74, master | ch2_flag);
+        assert_eq!(dma.dicr & ch2_flag, 0);
+        assert!(!dma.irq_out());
+    }
+
+    #[test]
+    fn completion_flag_is_not_created_without_channel_and_master_enables() {
+        let mut dma = Dma::new();
+        dma.write32(0x74, 1 << 23);
+        dma.ch[2].chcr = 1 << 24;
+        dma.finishing[2] = Some(10);
+        dma.tick(10);
+
+        assert_eq!(dma.dicr & (1 << 26), 0);
+        assert!(!dma.irq_out());
+        assert!(!dma.irq_edge);
     }
 }

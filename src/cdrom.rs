@@ -291,6 +291,9 @@ impl CdRom {
                     self.resp.extend(r.bytes.iter().copied());
                     if let Some(s) = r.sector {
                         self.sector = s;
+                        // The drive replaced its buffer: any bytes the host
+                        // hadn't drained from the old sector are gone.
+                        self.data.clear();
                     }
                     self.int_flag = r.int;
                 }
@@ -691,6 +694,7 @@ impl CdRom {
                 if !self.resp.is_empty() {
                     s |= 1 << 5;
                 }
+                // DRQSTS: the host-visible data FIFO has unread bytes.
                 if !self.data.is_empty() {
                     s |= 1 << 6;
                 }
@@ -723,19 +727,21 @@ impl CdRom {
             (2, 2) => self.vol_pending[0] = v,
             (2, 3) => self.vol_pending[3] = v,
             (3, 0) => {
-                if v & 0x80 != 0 {
-                    if self.data.is_empty() {
-                        let (off, len) = if self.mode & 0x20 != 0 {
-                            (12, 2340)
-                        } else {
-                            (24, 2048)
-                        };
-                        self.data
-                            .extend(self.sector[off..off + len].iter().copied());
-                    }
-                } else {
-                    self.data.clear();
+                if v & 0x80 != 0 && self.data.is_empty() {
+                    // BFRD: start reading the drive's sector buffer. A
+                    // second BFRD=1 while bytes remain unread continues
+                    // the same sector (the game reads the 12-byte header
+                    // and the 2048-byte payload with two such requests).
+                    let (off, len) = if self.mode & 0x20 != 0 {
+                        (12, 2340)
+                    } else {
+                        (24, 2048)
+                    };
+                    self.data
+                        .extend(self.sector[off..off + len].iter().copied());
                 }
+                // BFRD=0 only stops requesting — it does not flush the
+                // FIFO. Real hw keeps the bytes until consumed/replaced.
                 self.request = v;
             }
             (3, 1) => {

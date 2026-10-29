@@ -124,7 +124,8 @@ impl Mdec {
             1 => {
                 self.state = State::Decode;
                 self.remaining = v & 0xFFFF;
-                self.halfwords.clear();
+                // Keep pending halfwords: the input FIFO is a continuous
+                // stream — a block may straddle two decode commands.
             }
             2 => {
                 self.state = State::QuantTable;

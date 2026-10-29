@@ -513,8 +513,18 @@ impl Emulator {
             return Some(cost);
         }
         let words = b.dma.word_count(ch);
-        if ch == 1 && b.mdec.out_len() < words as usize {
-            return None;
+        if ch == 1 {
+            // MDEC-out: the transfer proceeds only while the MDEC has
+            // decoded output. A channel enabled with an idle MDEC has no
+            // transfer in flight — complete it immediately so software
+            // polling CHCR busy sees an idle channel (the game's stream
+            // producer gates sector copies on MDEC-out being idle).
+            if b.mdec.out_len() == 0 {
+                return Some(0);
+            }
+            if b.mdec.out_len() < words as usize {
+                return None;
+            }
         }
         let mut a = c.madr & 0x1F_FFFC;
         let rd = |b: &Bus, a: u32| {
