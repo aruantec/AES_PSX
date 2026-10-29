@@ -177,10 +177,38 @@ fn start_audio(queue: AudioQueue) -> Option<cpal::Stream> {
     Some(stream)
 }
 
+/// Fall back to the common SDL/HID button ordinals for menu buttons that
+/// gilrs reports as unknown: Select is 8 and Start is 9.
+fn raw_menu_buttons(
+    id: usize,
+    raw_buttons: &HashSet<(usize, u32)>,
+    unknown_buttons: &HashSet<(usize, u32)>,
+    start_code: Option<u32>,
+    select_code: Option<u32>,
+) -> u16 {
+    let mut bits = 0;
+    let start_pressed = start_code.map_or_else(
+        || unknown_buttons.contains(&(id, 9)),
+        |code| raw_buttons.contains(&(id, code)),
+    );
+    if start_pressed {
+        bits |= b::START;
+    }
+    let select_pressed = select_code.map_or_else(
+        || unknown_buttons.contains(&(id, 8)),
+        |code| raw_buttons.contains(&(id, code)),
+    );
+    if select_pressed {
+        bits |= b::SELECT;
+    }
+    bits
+}
+
 fn pad_state(
     keys: &HashSet<KeyCode>,
     gilrs: Option<&Gilrs>,
     raw_buttons: &HashSet<(usize, u32)>,
+    unknown_buttons: &HashSet<(usize, u32)>,
     start_code: Option<u32>,
     select_code: Option<u32>,
 ) -> u16 {
@@ -207,12 +235,13 @@ fn pad_state(
     if let Some(g) = gilrs {
         for (id, pad) in g.gamepads() {
             let id = usize::from(id);
-            if start_code.is_some_and(|c| raw_buttons.contains(&(id, c))) {
-                bits |= b::START;
-            }
-            if select_code.is_some_and(|c| raw_buttons.contains(&(id, c))) {
-                bits |= b::SELECT;
-            }
+            bits |= raw_menu_buttons(
+                id,
+                raw_buttons,
+                unknown_buttons,
+                start_code,
+                select_code,
+            );
             let map = [
                 (Button::DPadUp, b::UP),
                 (Button::DPadDown, b::DOWN),
@@ -2162,6 +2191,8 @@ struct App {
     /// Raw gilrs event codes currently held down, for pads whose
     /// Start/Select arrive unmapped (Button::Unknown or wrong names).
     pressed_pad_buttons: HashSet<(usize, u32)>,
+    /// Button ordinals from gamepads which gilrs cannot map semantically.
+    unknown_pad_buttons: HashSet<(usize, u32)>,
     pad_start_code: Option<u32>,
     pad_select_code: Option<u32>,
     winmm_pads: Vec<u32>,
@@ -2200,15 +2231,33 @@ impl App {
         if let Some(g) = self.gilrs.as_mut() {
             while let Some(ev) = g.next_event() {
                 match ev.event {
-                    EventType::ButtonPressed(_, code)
-                    | EventType::ButtonChanged(_, _, code)
-                    | EventType::ButtonRepeated(_, code) => {
-                        self.pressed_pad_buttons
-                            .insert((usize::from(ev.id), code.into_u32()));
+                    EventType::ButtonPressed(button, code)
+                    | EventType::ButtonRepeated(button, code) => {
+                        let id = usize::from(ev.id);
+                        let code = code.into_u32();
+                        self.pressed_pad_buttons.insert((id, code));
+                        if button == Button::Unknown {
+                            self.unknown_pad_buttons.insert((id, code));
+                        }
+                    }
+                    EventType::ButtonChanged(button, value, code) => {
+                        let id = usize::from(ev.id);
+                        let code = code.into_u32();
+                        if value > 0.5 {
+                            self.pressed_pad_buttons.insert((id, code));
+                            if button == Button::Unknown {
+                                self.unknown_pad_buttons.insert((id, code));
+                            }
+                        } else {
+                            self.pressed_pad_buttons.remove(&(id, code));
+                            self.unknown_pad_buttons.remove(&(id, code));
+                        }
                     }
                     EventType::ButtonReleased(_, code) => {
-                        self.pressed_pad_buttons
-                            .remove(&(usize::from(ev.id), code.into_u32()));
+                        let id = usize::from(ev.id);
+                        let code = code.into_u32();
+                        self.pressed_pad_buttons.remove(&(id, code));
+                        self.unknown_pad_buttons.remove(&(id, code));
                     }
                     EventType::Connected => {
                         let pad = g.gamepad(ev.id);
@@ -2230,6 +2279,7 @@ impl App {
             &self.keys,
             self.gilrs.as_ref(),
             &self.pressed_pad_buttons,
+            &self.unknown_pad_buttons,
             self.pad_start_code,
             self.pad_select_code,
         );
@@ -2554,7 +2604,7 @@ fn main() {
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let Some(cue) = pos.first() else {
         eprintln!(
-            "usage: play_gpu <game.cue> [bios.bin] [--fast] [--dynarec] [--mute] [--res=2x|4x|6x|8x|WIDTHxHEIGHT] [--texture-filter=nearest|bilinear] [--crt=on|off]"
+            "usage: play_gpu <game.cue> [bios.bin] [--fast] [--dynarec] [--mute] [--res=2x|4x|6x|8x|WIDTHxHEIGHT] [--texture-filter=nearest|bilinear] [--crt=on|off] [--pad-start-code=N] [--pad-select-code=N]"
         );
         eprintln!(
             "Use --window-size=WIDTHxHEIGHT to resize only the window; press C to toggle CRT."
@@ -2622,6 +2672,7 @@ fn main() {
             .map_err(|e| eprintln!("gamepad init failed: {e}"))
             .ok(),
         pressed_pad_buttons: HashSet::new(),
+        unknown_pad_buttons: HashSet::new(),
         pad_start_code,
         pad_select_code,
         winmm_pads: {
@@ -2662,9 +2713,33 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUDIO_RING_CAP, AudioRing, Duration, Instant, Ordering, advance_frame_deadline,
+        AUDIO_RING_CAP, AudioRing, Duration, HashSet, Instant, Ordering, advance_frame_deadline, b,
         parse_crt_filter, parse_internal_scale, parse_texture_filter, parse_window_size,
+        raw_menu_buttons,
     };
+
+    #[test]
+    fn unknown_gamepad_buttons_8_and_9_map_to_select_and_start() {
+        let raw = HashSet::new();
+        let unknown = HashSet::from([(0, 8), (0, 9)]);
+
+        assert_eq!(
+            raw_menu_buttons(0, &raw, &unknown, None, None),
+            b::SELECT | b::START
+        );
+        assert_eq!(raw_menu_buttons(1, &raw, &unknown, None, None), 0);
+    }
+
+    #[test]
+    fn explicit_raw_codes_override_unknown_button_ordinals() {
+        let raw = HashSet::from([(0, 31), (0, 30)]);
+        let unknown = HashSet::from([(0, 8), (0, 9)]);
+
+        assert_eq!(
+            raw_menu_buttons(0, &raw, &unknown, Some(31), Some(30)),
+            b::SELECT | b::START
+        );
+    }
 
     #[test]
     fn parses_ascii_and_unicode_resolution_separators() {

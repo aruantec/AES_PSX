@@ -24,8 +24,6 @@ const MAC44_NEG: i64 = -(1 << 43);
 
 /// UNR division table — generated from the documented hardware
 /// formula `unr_table[i] = max(0, (0x40000/(i+0x100)+1)/2 - 0x101)`.
-/// This is a hardware fact (contents of the GTE's divider ROM), not
-/// copied code.
 const fn build_unr() -> [i32; 0x101] {
     let mut t = [0i32; 0x101];
     let mut i = 0;

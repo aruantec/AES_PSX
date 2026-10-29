@@ -8,9 +8,6 @@
 //! - Devices advance with the CPU's cycle count; the video model
 //!   produces scanline/blanking edges for timers, GPUSTAT and VBlank.
 //! - Save-state hooks for the warm-boot snapshot cache (`snapshot.rs`).
-//!
-//! Clean-room: hardware semantics from public hardware documentation
-//! only; no ported code.
 
 pub mod bus;
 pub mod cdrom;
